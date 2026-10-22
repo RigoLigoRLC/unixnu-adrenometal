@@ -164,6 +164,9 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         options.metal_level = Some(MetalLevel::NEWEST);
         options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache.to_string_lossy().into_owned());
         options.messages = Some(MessageSink::new(observe_message));
+        // The window server's textures keep no data between padded rows, so render targets
+        // and writable textures can use images over their backing buffers at the existing row pitch.
+        options.policy.padded_reads = metal2vulkan::device::PaddedReadsPolicy::AliasWrites;
         Ok(boxed(NmbDevice(Device::system_default_with(&options).map_err(e("device"))?, std::sync::OnceLock::new(), std::sync::Mutex::new(()))))
     })
 }
