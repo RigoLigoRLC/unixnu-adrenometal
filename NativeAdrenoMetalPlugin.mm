@@ -136,7 +136,9 @@ static void reportDisplayState(Gpu &gpu) {
         markSample(gpu, now, 0xA000);
     } @catch (NSException *) {}
 }
-// Whether NativeAdrenoMetal.clients names this process (names separated by blanks, commas or new lines; "*" names every process).
+// Whether NativeAdrenoMetal.clients names this process (names separated by blanks, commas or new lines; "*" names every process; a
+// name that ends in "*" names every process whose name starts with it, so "com.apple.WebKit.*" covers the WebContent, Networking
+// and GPU service processes).
 static bool listedClient() {
     char path[1024];
     if (!requestedPath("NativeAdrenoMetal.clients", path, sizeof path)) return false;
@@ -147,14 +149,18 @@ static bool listedClient() {
     fclose(file);
     text[length] = 0;
     const char *self = getprogname();
-    for (char *save = nullptr, *name = strtok_r(text, " ,\t\r\n", &save); name; name = strtok_r(nullptr, " ,\t\r\n", &save))
+    for (char *save = nullptr, *name = strtok_r(text, " ,\t\r\n", &save); name; name = strtok_r(nullptr, " ,\t\r\n", &save)) {
         if (!strcmp(name, "*") || !strcmp(name, self)) return true;
+        const size_t nameLength = strlen(name);
+        if (nameLength && name[nameLength - 1] == '*' && !strncmp(name, self, nameLength - 1)) return true;
+    }
     return false;
 }
 // A listed process other than the render server: the same runtime on its own connection, with none of the render server's threads (no
 // display hand-off, telemetry, benchmark or cache export). Its shader cache lives in its own cache or temp directory.
 // The reason a client's device failed, as a text line the driver keeps per process (the render server's report row is rewritten every ten seconds):
 // "<step> <detail>", through the marker stream (a connection is not needed). The Gpu object is made only on this path.
+static unsigned gClientPort;
 static void clientFailure(unsigned port, const char *step, const char *detail) {
     if (Gpu *gpu = makeGpu(port)) {
         char text[64];
@@ -194,6 +200,15 @@ static id clientDevice(unsigned port) {
         if (!device && !lastError[0]) lastError = nmb_last_error();
     }
     if (!device) clientFailure(port, usable ? "no-device" : "no-cachedir", lastError);
+    // The client's first problem, once, on the same text line, sent from the thread that hit it: WidgetRenderer crashed on a nil render
+    // encoder with no reason anywhere readable (its own log lines need the plugin's format strings, which the device does not keep), and a
+    // once-a-second reader never ran before the crash (i568).
+    if (device) {
+        gClientPort = port;
+        native_bridge_metal_problem_hook = [](const char *problem) {clientFailure(gClientPort, "problem", problem);};
+        char problem[200] = {};
+        if (native_bridge_metal_first_problem(problem, sizeof problem) && problem[0]) clientFailure(port, "problem", problem);
+    }
     return device;
 }
 static id deviceForPort(unsigned port) {
@@ -203,12 +218,11 @@ static id deviceForPort(unsigned port) {
         if (tried) return device;
         tried = true;
         exceptiondiag::start(); // the throw site of an uncaught exception, for the kernel's THROW row (ExceptionDiag.h)
-        // Every Metal process renders in system memory: Turnip's GMEM passes hand work between the BV and BR threads, and with IFPC off
-        // and a context reset on every client switch the two still stopped waiting on each other inside a pass (int-261p, int-262: GPU idle,
-        // BR one IB ahead, BV inside a draw IB2). int-257's nobin covered the render server only. System memory alone still let BV run
-        // ahead of BR across passes (concurrent binning is emitted for sysmem passes too) and it hung the same way in int-265: no
-        // concurrent binning either.
-        setenv("TU_DEBUG", "sysmem,nocb", 0);
+        // No concurrent binning in any Metal process: with it BV ran ahead of BR and the two stopped waiting on each other inside a pass
+        // (int-261p, int-262, and in system memory int-265). Without it Turnip's autotune picks tile memory (GMEM) or system memory per
+        // pass: i553 forced system memory for every pass, the GPU busy 19 % at 680 MHz. A tile store writes whole 16x4 blocks, which the
+        // runtime keeps within a texture's rows (bridge patch 0016).
+        setenv("TU_DEBUG", "nocb", 0);
         if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);
         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
         if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
@@ -363,11 +377,17 @@ static id deviceForPort(unsigned port) {
             }
             return nullptr;
         }, gpu);
-        pthread_t exporter;
-        pthread_create(&exporter, &attributes, [](void *arg) -> void * {
-            cacheexport::run(*static_cast<Gpu *>(arg), gCacheDirectory);
-            return nullptr;
-        }, gpu);
+        // The cache directory's export to the UFS log only when NativeAdrenoMetal.cacheexport sits beside the bundle: Data persists across
+        // boots now, so the caches no longer need the trip through the host, and once priming has filled the directory, every rescan and
+        // export competed with the render server (int-245: the scanning thread at 45% CPU, the sending one at 48%, frames twice as slow).
+        char exportPath[1024];
+        if (requestedPath("NativeAdrenoMetal.cacheexport", exportPath, sizeof exportPath)) {
+            pthread_t exporter;
+            pthread_create(&exporter, &attributes, [](void *arg) -> void * {
+                cacheexport::run(*static_cast<Gpu *>(arg), gCacheDirectory);
+                return nullptr;
+            }, gpu);
+        }
         // Every Metal library of the OS through the runtime, 90 s after the render server opened the device (PrimeShaders.h); the boots that froze
         // or crashed before three minutes never primed anything. Progress is kept in the Data cache directory, so later boots resume.
         // The translator recurses deeply on large functions: give it the stack of a main thread.
