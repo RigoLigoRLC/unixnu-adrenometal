@@ -42,7 +42,7 @@ index 8b3a0c2..ff051e0 100644
              if state.status == CommandBufferStatus::Completed {
                  state.descriptors.give_back();
 diff --git a/crates/metal2vulkan-runtime/src/spares.rs b/crates/metal2vulkan-runtime/src/spares.rs
-index 39ac4d8..c16a129 100644
+index 39ac4d8..c87b2ca 100644
 --- a/crates/metal2vulkan-runtime/src/spares.rs
 +++ b/crates/metal2vulkan-runtime/src/spares.rs
 @@ -5,18 +5,13 @@
@@ -88,11 +88,11 @@ index 39ac4d8..c16a129 100644
  use std::collections::VecDeque;
  use std::sync::Mutex;
  
-+/// The most idle command pools per queue family on iOS, matching Adreno's eight submission slots.
-+const COMMAND_POOLS_PER_FAMILY: usize = 8;
++/// The most idle command pools per queue family on iOS; eight reclaimed pools during a transition.
++const COMMAND_POOLS_PER_FAMILY: usize = 64;
 +
 +/// The most Vulkan command buffers an idle iOS pool keeps before its driver storage is released.
-+const COMMAND_BUFFERS_PER_POOL: usize = 64;
++const COMMAND_BUFFERS_PER_POOL: usize = 256;
 +
  /// The most spare descriptor pools a device keeps.
  pub(super) const DESCRIPTOR_POOLS: usize = 32;
