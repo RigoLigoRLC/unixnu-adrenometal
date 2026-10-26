@@ -1,0 +1,123 @@
+diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
+index de3df1e..d196e88 100644
+--- a/crates/metal2vulkan-runtime/src/memory.rs
++++ b/crates/metal2vulkan-runtime/src/memory.rs
+@@ -37,16 +37,14 @@ use super::buffer::usage;
+ use super::device::lock;
+ #[cfg(unix)]
+ use super::dma_buf::DmaBufPages;
+-use super::error::{internal, vulkan, Error, MemoryKind};
++use super::error::{Error, MemoryKind, internal, vulkan};
+ use super::range::RangeAllocator;
+ use super::sharing::Sharing;
+ use super::work_counts::Counters;
+ use crate::release;
+ use ash::vk;
+ use std::ptr::NonNull;
+-#[cfg(unix)]
+-use std::sync::Arc;
+-use std::sync::Mutex;
++use std::sync::{Arc, Mutex, TryLockError};
+ 
+ /// The size of a pooled block, at most the device's `maxMemoryAllocationSize`.
+ pub(super) const BLOCK_BYTES: u64 = 64 << 20;
+@@ -646,11 +644,17 @@ impl Placement {
+     }
+ }
+ 
+-/// The device's memory: one [`Pool`] per memory type for buffers, and one for images.
++/// The device's memory contains separate buffer and image pools for each memory type.
++/// Existing placements and releases use the memory mutex. Each pool has a separate
++/// growth mutex, acquired without holding the memory mutex, which orders allocation
++/// of new pooled blocks. A waiting allocator checks the pool again after acquiring
++/// that mutex, so concurrent misses share the block the first allocator creates.
+ pub(super) struct Memory {
+     types: Vec<vk::MemoryType>,
+     /// The buffers' pools by memory type, then the images' ([`Memory::pool`]).
+     pools: Vec<Pool<Block>>,
++    /// One allocation mutex per pool, in the same order as `pools`.
++    growth: Vec<Arc<Mutex<()>>>,
+     block_bytes: u64,
+     /// Blocks are allocated with `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT`: the device enabled
+     /// `bufferDeviceAddress`, so buffers carry device addresses.
+@@ -688,6 +692,9 @@ impl Memory {
+             pools: (types.iter().chain(&types))
+                 .map(|_| Pool::default())
+                 .collect(),
++            growth: (types.iter().chain(&types))
++                .map(|_| Arc::new(Mutex::new(())))
++                .collect(),
+             types,
+             block_bytes: BLOCK_BYTES.min(max_allocation.max(1)),
+             device_address,
+@@ -1348,9 +1355,9 @@ pub(super) fn allocate_addressed(
+ 
+ /// [`allocate`], in a block with a buffer of addresses where `addressed` gives the counts of the
+ /// buffers of addresses made, of the blocks that hold `holds`, pooled or in a block of its own
+-/// as `fit` says. A new block is made with `memory`'s lock released: the device's other threads'
+-/// placements, which the lock orders, wait for no `vkAllocateMemory`, which on NVIDIA's driver
+-/// waited 2.37 s for other processes' GPU work.
++/// as `fit` says. A new block is made with `memory`'s lock released. Existing blocks remain
++/// available to other placements and releases while the driver allocates. Pooled growth
++/// takes the pool's allocation mutex and checks for space again before making a block.
+ fn place(
+     memory: &Mutex<Memory>,
+     device: &ash::Device,
+@@ -1385,6 +1392,24 @@ fn place(
+                 return Ok(placement);
+             }
+         }
++
++        let growth = if dedicated {
++            None
++        } else {
++            let memory = lock(memory);
++            Some(Arc::clone(
++                &memory.growth[memory.pool_at(holds, type_index)],
++            ))
++        };
++        let _growing = growth.as_ref().map(|growth| lock(growth));
++        if growth.is_some() {
++            if let Some(placement) =
++                lock(memory).place_pooled(device, pool, size, align, addressed)?
++            {
++                return Ok(placement);
++            }
++        }
++
+         match maker.make(device, type_index, block_size, addressed) {
+             Ok(block) => {
+                 let mut memory = lock(memory);
+@@ -1404,7 +1429,8 @@ fn place(
+ /// that an encoding or a commit, which must wait for no other process's GPU work, finds a block
+ /// with room rather than making one. A block of buffers gets its buffer of addresses (counted in
+ /// `counts`) where blocks carry one. A block that fails to be made, or a pool the query fails for,
+-/// is left to the placement that needs it.
++/// is left to the placement that needs it. A pool already growing is skipped;
++/// its allocator publishes the new block before releasing the growth mutex.
+ pub(super) fn keep_room(memory: &Mutex<Memory>, device: &ash::Device, counts: &Counters) {
+     let (lacking, maker) = {
+         let mut memory = lock(memory);
+@@ -1418,6 +1444,22 @@ pub(super) fn keep_room(memory: &Mutex<Memory>, device: &ash::Device, counts: &C
+         (lacking, memory.maker())
+     };
+     for pool in lacking {
++        let growth = {
++            let memory = lock(memory);
++            Arc::clone(&memory.growth[memory.pool_at(pool.0, pool.1)])
++        };
++        let _growing = match growth.try_lock() {
++            Ok(guard) => guard,
++            Err(TryLockError::WouldBlock) => continue,
++            Err(TryLockError::Poisoned(error)) => error.into_inner(),
++        };
++        if lock(memory)
++            .pool_ref(pool.0, pool.1)
++            .has_room(maker.block_bytes / 2)
++        {
++            continue;
++        }
++
+         let addressed = (pool.0 == Holds::Buffers).then_some(counts);
+         let Ok(block) = maker.make(device, pool.1, maker.block_bytes, addressed) else {
+             continue;
