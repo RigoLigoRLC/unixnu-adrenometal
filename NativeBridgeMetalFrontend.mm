@@ -27,6 +27,7 @@
 #include <unistd.h>
 #include "bridge/NativeMetalObjects.h"
 #include "NativeBridgeMetalFrontend.h"
+#include "NativeAdrenoMetalConfig.h"
 
 extern "C" void sys_dcache_flush(void *start, size_t length);
 
@@ -84,6 +85,10 @@ static void tracePush(const TraceRec &rec) {
 static void traceStartWriter();
 // type 5 swap served by the scanout client: {idx, t0 offer arrived, t1 GPU copy returned, t2 swap completed, a sequence, b result}
 extern "C" void NBTraceSwap(uint64_t offered,uint64_t copied,uint64_t completed,uint32_t sequence,uint32_t result) {
+ if(!NATIVE_ADRENO_FRAME_TRACE) {
+  return;
+ }
+
  TraceRec rec={};rec.type=5;rec.t0=offered;rec.t1=copied;rec.t2=completed;rec.a=sequence;rec.b=result;tracePush(rec);
  traceStartWriter();
 }
@@ -141,6 +146,9 @@ static void sampleWindowOpen() {
  }).detach();
 }
 static void sampleWindowClose() {
+#ifndef NB_SAMPLER
+ return;
+#endif
  if(gSampleThread.load()==pthread_mach_thread_np(pthread_self()))gSampleThread.store(0);
 }
 static void sampleWriteProfile(uint32_t &consumed,int &fd,const char *const *paths) {
@@ -201,6 +209,10 @@ static void sampleWriteProfile(uint32_t &consumed,int &fd,const char *const *pat
  if(write(fd,out.data(),out.size())<0)return;
 }
 static void traceStartWriter() {
+ if(!NATIVE_ADRENO_FRAME_TRACE) {
+  return;
+ }
+
  bool expected=false;
  if(!gTraceStarted.compare_exchange_strong(expected,true))return;
  std::thread([]{
@@ -270,7 +282,18 @@ static void noteProblem(NSString *what) {
  memcpy(gLastProblems[1],gLastProblems[0],sizeof gLastProblems[0]);
  strlcpy(gLastProblems[0],what.UTF8String?:"?",sizeof gLastProblems[0]);
 }
-#define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];NSLog(@"%@",nbText);noteProblem(nbText);}while(0)
+static void logProblem(NSString *what) {
+ static std::atomic<uint32_t> printed{0};
+ const uint32_t at=printed.fetch_add(1);
+ if(at<32) {
+  NSLog(@"%@",what);
+ } else if(at==32) {
+  NSLog(@"native-metal: further errors retained in status counters");
+ }
+
+ noteProblem(what);
+}
+#define NBLOG(...) do{logProblem([NSString stringWithFormat:__VA_ARGS__]);}while(0)
 // The pixel formats textures were asked for (first eight distinct), with how many were refused: native_bridge_metal_formats.
 static uint32_t gFormats[8];static unsigned gFormatCount;static std::atomic<uint64_t> gTextureRefusals;
 // Textures over IOSurfaces: made, refused, and how many of the requests named a planar surface.
@@ -1027,7 +1050,16 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
 @implementation NBCommandBuffer
 - (instancetype)init {
  if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
- if(self){createdUs=nowUs();createCpu=threadCpuUs();createTid=threadIdLow();earlyEligible=onRenderServerThread();sampleWindowOpen();}
+ if(self) {
+  createdUs=nowUs();
+  if(NATIVE_ADRENO_FRAME_TRACE) {
+   createCpu=threadCpuUs();
+   createTid=threadIdLow();
+  }
+
+  earlyEligible=earlyOn() && onRenderServerThread();
+  sampleWindowOpen();
+ }
  return self;
 }
 - (void)dealloc {nmb_command_buffer_release(_handle);}
@@ -1173,7 +1205,12 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
  self.committed=YES;
  self.committedUs=nowUs();
- commitCpu=threadCpuUs();commitTid=threadIdLow();sampleWindowClose();
+ if(NATIVE_ADRENO_FRAME_TRACE) {
+  commitCpu=threadCpuUs();
+  commitTid=threadIdLow();
+ }
+
+ sampleWindowClose();
  {
   std::lock_guard<std::mutex> lock(gCommitLock);
   // Assign once under the same lock as publication. A concurrent commit cannot reuse this index.
@@ -1208,13 +1245,15 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
  if(!self.committed)return;
  const uint64_t began=nowUs();
  if(!self.failedLocally)nmb_command_buffer_wait(_handle,0);
- const uint32_t cpuStart=threadCpuUs();
+ const uint32_t cpuStart=NATIVE_ADRENO_FRAME_TRACE?threadCpuUs():0;
  dispatch_group_wait(_handlers,DISPATCH_TIME_FOREVER);
- {
+ if(NATIVE_ADRENO_FRAME_TRACE) {
   TraceRec rec={};rec.type=2;rec.t0=began;rec.t1=nowUs();rec.tid=threadIdLow();rec.a=(uint32_t)(uintptr_t)__builtin_return_address(0);
   rec.cpu0=cpuStart;rec.cpu1=threadCpuUs();traceNote(rec.tid);tracePush(rec);
  }
- noteWaitCaller((uint64_t)__builtin_return_address(0)&0xfffffffffull,(uint64_t)__builtin_return_address(0),nowUs()-began);
+ if(NATIVE_ADRENO_FRAME_TRACE) {
+  noteWaitCaller((uint64_t)__builtin_return_address(0)&0xfffffffffull,(uint64_t)__builtin_return_address(0),nowUs()-began);
+ }
  gTimeWaitCompleted.add(began);
 }
 - (void)waitUntilScheduled {
@@ -1223,9 +1262,9 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
  if(!self.failedLocally && !nmb_command_buffer_wait_scheduled(_handle)){
   NBLOG(@"native-metal: waitUntilScheduled refused: %@",lastError());return;
  }
- const uint32_t cpuStart=threadCpuUs();
+ const uint32_t cpuStart=NATIVE_ADRENO_FRAME_TRACE?threadCpuUs():0;
  dispatch_group_wait(_schedulingHandlers,DISPATCH_TIME_FOREVER);
- {
+ if(NATIVE_ADRENO_FRAME_TRACE) {
   TraceRec rec={};rec.type=3;rec.t0=began;rec.t1=nowUs();rec.tid=threadIdLow();rec.a=(uint32_t)(uintptr_t)__builtin_return_address(0);
   rec.cpu0=cpuStart;rec.cpu1=threadCpuUs();traceNote(rec.tid);tracePush(rec);
  }
@@ -1252,7 +1291,7 @@ static void completed(void *context) {
   CommitRecord &r=gCommitRing[commandBuffer.commitIndex%32];
   if(r.index==commandBuffer.commitIndex) {
    r.callbackUs=took;
-   {
+   if(NATIVE_ADRENO_FRAME_TRACE) {
     traceStartWriter();traceNote(commandBuffer->createTid);
     if(commandBuffer->commitTid!=commandBuffer->createTid)traceNote(commandBuffer->commitTid);
     TraceRec rec={};rec.type=1;rec.idx=r.index;rec.t0=commandBuffer->createdUs;rec.t1=r.committedUs;rec.t2=r.scheduledUs>=0?r.committedUs+(uint64_t)r.scheduledUs:0;
@@ -1739,7 +1778,8 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  std::vector<NmbBinaryArchive *> archives;
  if(!pipelineArchives(d.binaryArchives,archives,error)){delete p;return nil;}
  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
- const uint64_t pipelineBegan=nowUs();const NBCost costBegan=NBCost::now();
+ const uint64_t pipelineBegan=nowUs();
+ const NBCost costBegan=gJournalPath.empty()?NBCost{}:NBCost::now();
  NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);delete p;gTimePipeline.add(pipelineBegan);
  journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),gJournalPath.empty()?std::string():NBCost::now().since(costBegan));
  if(!handle)return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);
@@ -1846,7 +1886,10 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  gMissing=missing;gInFlight=[NSMutableSet set];
  gDevice=nmb_device_open(loader,cache);
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
- if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
+ if(cache && NATIVE_ADRENO_PIPELINE_JOURNAL) {
+  gJournalPath=std::string(cache)+"/pipelines.log";
+  gJournalBegan=nowUs();
+ }
  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
  // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
  {char waived[4096]={};nmb_device_family_waivers(gDevice,waived,sizeof waived);

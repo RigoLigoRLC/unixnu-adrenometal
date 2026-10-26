@@ -3,8 +3,8 @@
 // initWithAcceleratorPort:). Default (stage 1): it runs the shared userspace GPU test (NativeAdrenoUserTest.h) from inside a real system
 // process, under that process's sandbox, and then returns nil. No device is registered, so the original software rendering keeps running unchanged.
 // Published (the image carries the file NativeAdrenoMetal.publish beside the bundle): backboardd, the one process that owns the GPU, returns the native
-// Metal frontend's device (the metal2vulkan runtime on Turnip, on the Adreno 740), which the original discovery registers; the CARenderServer then
-// renders the system UI through it, and the display driver's frames are written to the scanout by the GPU (GpuScanoutClient.h). Another process
+// Metal frontend's device (the metal2vulkan runtime on Turnip), which the original discovery registers; the CARenderServer then
+// renders the system UI through it. The board can additionally enable the GPU copy into the display driver's framebuffer (GpuScanoutClient.h). Another process
 // gets its own native device (its own driver connection, GPU address window and shader cache) when its name is listed in the file
 // NativeAdrenoMetal.clients beside the bundle ("*" lists every process); an unlisted one returns nil and keeps the software renderer.
 #import <Foundation/Foundation.h>
@@ -65,6 +65,7 @@ static Gpu *makeGpu(unsigned port) {
 static std::string gCacheDirectory;   // the runtime's cache directory (the one that opened the device), exported by CacheExport.h
 // Progress markers 0x68xx (GPU6): 6800 entered, 6801 Turnip found, 6802 device made, 6803 returned to the discovery, 68f1 no Turnip, 68f2 no device.
 static unsigned gDiagBits;
+#if NATIVE_ADRENO_QUARTZCORE_DISPLAY_STATE
 // Reads of the render server's own state for the framebuffer-format question (diagnostic only, for the exact QuartzCore of the target image; a read
 // that fails or a build that differs reports zeros). Each value is one marker, 0x7Kvv: K picks the item, vv the value.
 static bool readTask(uintptr_t address, void *out, size_t size) {
@@ -74,8 +75,8 @@ static bool readTask(uintptr_t address, void *out, size_t size) {
 static bool writeTask(uintptr_t address, const void *data, size_t size) {
     return vm_write(mach_task_self(), address, (vm_offset_t) data, (mach_msg_type_number_t) size) == KERN_SUCCESS;
 }
-// EXPERIMENT (second report onward): this display path takes plain 8-bit BGRA only, so tell the render server's display that it has neither the deep
-// (10-bit) framebuffer nor universal buffer compression. Whether the state it reads those from is the whole story is what the markers show.
+// The second report clears the render server display's deep-framebuffer flag and
+// universal compression byte at the addresses selected for the A740 OS image.
 static unsigned gReports;
 struct DisplaySample {unsigned flags = 0, mode = 0, behaviour = 0, globals = 0; uint16_t display = 0; uintptr_t object = 0;};
 static DisplaySample sampleDisplay(id first, intptr_t slide) {
@@ -136,6 +137,7 @@ static void reportDisplayState(Gpu &gpu) {
         markSample(gpu, now, 0xA000);
     } @catch (NSException *) {}
 }
+#endif
 // Whether NativeAdrenoMetal.clients names this process (names separated by blanks, commas or new lines; "*" names every process; a
 // name that ends in "*" names every process whose name starts with it, so "com.apple.WebKit.*" covers the WebContent, Networking
 // and GPU service processes).
@@ -218,11 +220,10 @@ static id deviceForPort(unsigned port) {
         if (tried) return device;
         tried = true;
         exceptiondiag::start(); // the throw site of an uncaught exception, for the kernel's THROW row (ExceptionDiag.h)
-        // No concurrent binning in any Metal process: with it BV ran ahead of BR and the two stopped waiting on each other inside a pass
-        // (int-261p, int-262, and in system memory int-265). Without it Turnip's autotune picks tile memory (GMEM) or system memory per
-        // pass: i553 forced system memory for every pass, the GPU busy 19 % at 680 MHz. A tile store writes whole 16x4 blocks, which the
-        // runtime keeps within a texture's rows (bridge patch 0016).
-        setenv("TU_DEBUG", "nocb", 0);
+        // The board selects Turnip's render-pass and concurrent-binning options.
+        if (NATIVE_ADRENO_TURNIP_DEBUG[0]) {
+            setenv("TU_DEBUG", NATIVE_ADRENO_TURNIP_DEBUG, 0);
+        }
         if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);
         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
         if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
@@ -309,8 +310,8 @@ static id deviceForPort(unsigned port) {
             return nil;
         }
         gpu->mark(0x6802);
-        // The status line (GPU8) every ten seconds, and the display hand-off client on its own thread: both only read or serve, neither is the discovery's.
-        pthread_t monitor, scanout;
+        // The monitor reports the runtime status every ten seconds.
+        pthread_t monitor;
         pthread_attr_t attributes;
         pthread_attr_init(&attributes);
         pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
@@ -335,7 +336,9 @@ static id deviceForPort(unsigned port) {
                     snprintf(text, sizeof text, "ST%u %.57s", step - 1, full + (size_t)(step - 1) * 57);
                 }
                 streamText(*g, text);
+#if NATIVE_ADRENO_QUARTZCORE_DISPLAY_STATE
                 reportDisplayState(*g);
+#endif
                 g->mark(0x6A00 | gDiagBits);   // the diagnostics page lists the last few markers only
             }
             return nullptr;
@@ -367,6 +370,8 @@ static id deviceForPort(unsigned port) {
             }
             return nullptr;
         }, gpu);
+#if NATIVE_ADRENO_SCANOUT_COPY
+        pthread_t scanout;
         pthread_create(&scanout, &attributes, [](void *arg) -> void * {
             Gpu *g = static_cast<Gpu *>(arg);
             sleep(3);
@@ -377,9 +382,8 @@ static id deviceForPort(unsigned port) {
             }
             return nullptr;
         }, gpu);
-        // The cache directory's export to the UFS log only when NativeAdrenoMetal.cacheexport sits beside the bundle: Data persists across
-        // boots now, so the caches no longer need the trip through the host, and once priming has filled the directory, every rescan and
-        // export competed with the render server (int-245: the scanning thread at 45% CPU, the sending one at 48%, frames twice as slow).
+#endif
+        // The cache export worker starts when the bundle has an explicit export request.
         char exportPath[1024];
         if (requestedPath("NativeAdrenoMetal.cacheexport", exportPath, sizeof exportPath)) {
             pthread_t exporter;

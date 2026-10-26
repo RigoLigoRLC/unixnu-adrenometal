@@ -167,8 +167,8 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         // A padded texture over a buffer uses an image over the same bytes when its
         // render stores fit within the backing rows and allocation.
         options.policy.padded_reads = metal2vulkan::device::PaddedReadsPolicy::AliasWrites;
-        // Every texture given a shadow image is announced with why no image aliases its bytes (`shadow.log`).
-        options.announce_each.insert(metal2vulkan_runtime::Degradation::ShadowedTexture);
+        // The frontend never rebinds a no-copy buffer, so encoders need no replay log.
+        options.refuse_rebinds = true;
         let _ = SHADOW_LOG.set(PathBuf::from(cache.to_string_lossy().into_owned()).join("shadow.log"));
         Ok(boxed(NmbDevice(Device::system_default_with(&options).map_err(e("device"))?, std::sync::OnceLock::new(), std::sync::Mutex::new(()))))
     })
@@ -587,7 +587,7 @@ pub unsafe extern "C" fn nmb_buffer_new(device: *mut NmbDevice, length: u64, opt
 }
 
 /// # Safety
-/// `pointer` is page aligned, holds `length` bytes and stays mapped until the buffer is released.
+/// `pointer` and `length` describe complete host pages, which stay mapped until the buffer is released.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nmb_buffer_new_no_copy(device: *mut NmbDevice, pointer: *mut c_void, length: u64, options_word: u64)
                                                 -> *mut NmbBuffer {
@@ -607,7 +607,7 @@ unsafe impl Send for ReleaseContext {}
 /// under the GPU. A refused call never runs it: the caller still owns `context`.
 ///
 /// # Safety
-/// `pointer` is page aligned, holds `length` bytes and stays mapped until `release` runs.
+/// `pointer` and `length` describe complete host pages, which stay mapped until `release` runs.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nmb_buffer_new_no_copy_releasing(device: *mut NmbDevice, pointer: *mut c_void, length: u64, options_word: u64,
                                                           release: Option<NmbRelease>, context: *mut c_void) -> *mut NmbBuffer {
@@ -627,6 +627,25 @@ unsafe fn no_copy(device: *mut NmbDevice, pointer: *mut c_void, length: u64, opt
                   -> *mut NmbBuffer {
     guard(std::ptr::null_mut(), || {
         let device = get(device)?;
+        // The native Metal API takes complete host pages. Importing only part
+        // of a caller's cache line would share noncoherent GPU writes with
+        // unrelated CPU data in the same allocation.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page <= 0 {
+            return Err(format!("cannot read host page size: {page}"));
+        }
+
+        let page = page as u64;
+        let address = pointer as usize as u64;
+        if page == 0 || !page.is_power_of_two() || address == 0 || length == 0
+            || (address | length) & (page - 1) != 0
+            || address.checked_add(length).is_none()
+        {
+            return Err(format!(
+                "no-copy requires complete host pages: pointer={address:#x} length={length} page={page}"
+            ));
+        }
+
         // SAFETY: the caller's contract.
         let memory = unsafe { HostMemory::new(NonNull::new(pointer as *mut u8).ok_or("null memory")?) };
         let modes = options(options_word)?;

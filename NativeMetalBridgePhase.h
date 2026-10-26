@@ -7,11 +7,14 @@
 // ends the same GPU7 line: "F0" (with the first unimplemented selector, if any), "F<failed> <marker> <first failure>", "Fo"/"Fx" + reason
 // when the device or the fixtures were refused.
 #pragma once
+#include "NativeAdrenoMetalConfig.h"
 #include "bridge/NativeMetalBridge.h"
 #include "bridge/NativeMetalObjects.h"
 #include "bridge/FrontendChecks.h"
 #include "NativeBridgeMetalFrontend.h"
+#if NATIVE_ADRENO_SCANOUT_COPY
 #include "GpuScanoutClient.h"
+#endif
 #include <fcntl.h>
 #include <pthread.h>
 #include <sys/mman.h>
@@ -32,7 +35,9 @@ struct Job {
 };
 static Gpu *gGpu;
 static Job *gJob;
+#if NATIVE_ADRENO_SCANOUT_COPY
 static id gDevice;   // the frontend device of the checks, kept for the scanout stage
+#endif
 static void mark(uint32_t value) {
     if (gJob) gJob->last = value;
     if (gGpu) gGpu->mark(value);
@@ -47,7 +52,9 @@ static void frontend(Job *job) {
     // The runtime's reasons are per thread: keep this worker's for the report.
     if (!device) {strlcpy(job->error, nmb_last_error(), sizeof job->error); return;}
     job->frontendOpened = true;
+#if NATIVE_ADRENO_SCANOUT_COPY
     gDevice = device;
+#endif
     size_t bytes = 0;
     const void *air = nmb_fixture_air(&bytes);
     id library = native_bridge_metal_library_with_air(air, bytes);
@@ -82,7 +89,8 @@ static void *worker(void *arg) {
     __atomic_store_n(&job->done, true, __ATOMIC_RELEASE);
     return nullptr;
 }
-// Serves the display driver's frames with the GPU on `device` (the kernel offers them only with sheng-fb-gpu=1). The calls go through a hand-off-only
+#if NATIVE_ADRENO_SCANOUT_COPY
+// The scanout client copies the display driver's frames with the GPU on `device` (the kernel offers them only with sheng-fb-gpu=1). The calls go through a hand-off-only
 // connection to the accelerator (open type 0x4148: no GPU slot is taken): the original sandbox profiles admit that class and not the presenter's own
 // service. Reports on GPU7 only when the state changes: "P<step> e<hex>" (0 no connection, 1 no selector, 2 mode refused, 3 scanout not
 // mappable/importable, 4 serving), then "PF <frames>/<failures> r<last result> v<verified>/<differing rows> t<ms>" at the first frame, every fifth after
@@ -141,6 +149,7 @@ static void serveScanout(Gpu &gpu, id device) {
     }
     streamText7(gpu, line);
 }
+#endif
 static void run(Gpu &gpu, const char *turnipPath) {
     gpu.mark(0x6500);
     Job *job = new Job{};
@@ -186,14 +195,18 @@ static void run(Gpu &gpu, const char *turnipPath) {
     const bool ok = !job->code && !r.compute_bad && !r.render_bad && !r.import_bad;
     gpu.mark(ok ? 0x65f0 : 0x65f1);
     if (!job->code) gpu.mark(job->frontendRan && !job->frontend.failed ? 0x66f0 : 0x66f1);
+#if NATIVE_ADRENO_SCANOUT_COPY
     const bool scanout = ok && job->frontendRan && !job->frontend.failed && gDevice;
+#endif
     gJob = nullptr;
     delete job;
-    // After the checks' verdict has been on the page for a while: serve the display driver's frames with the GPU.
+#if NATIVE_ADRENO_SCANOUT_COPY
+    // The scanout client starts after the checks' verdict has remained visible for eight seconds.
     if (scanout) {
         sleep(8);
         serveScanout(gpu, gDevice);
     }
+#endif
     gGpu = nullptr;
 }
 }  // namespace bridgephase

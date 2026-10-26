@@ -13,6 +13,7 @@
 #pragma once
 #define VK_NO_PROTOTYPES 1
 #include <vulkan/vulkan_core.h>
+#include "NativeAdrenoMetalConfig.h"
 #include "NativeTurnipShaders.h"   // generated: scripts/gen-turnip-smoke-shaders.py
 #include <dlfcn.h>
 #include <mach/mach.h>
@@ -433,10 +434,10 @@ static Result run(Marker &&mark, const char *libraryPath) {
     // system process whose home directory is not ours to fill.
     setenv("TU_DARWIN_SERVICE", "IOAcceleratorES", 0);
     setenv("MESA_SHADER_CACHE_DISABLE", "true", 0);
-    // Concurrent binning (BV running ahead of BR) is a performance feature; its barriers make BR wait for BV timestamps. int-058's
-    // first fill hung with the ring stopped inside the IB (no fault), before the kernel framed IBs for both threads. Keep it off
-    // until a run with the framing has passed.
-    setenv("TU_DEBUG", "nocb", 0);
+    // The board selects Turnip's submission options for its command processor.
+    if (NATIVE_ADRENO_TURNIP_SMOKE_DEBUG[0]) {
+        setenv("TU_DEBUG", NATIVE_ADRENO_TURNIP_SMOKE_DEBUG, 0);
+    }
 
     void *lib = dlopen(libraryPath, RTLD_NOW | RTLD_LOCAL);
     if (!lib) return fail(1, -1);
