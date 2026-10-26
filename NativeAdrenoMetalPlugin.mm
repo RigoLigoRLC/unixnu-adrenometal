@@ -138,9 +138,7 @@ static void reportDisplayState(Gpu &gpu) {
     } @catch (NSException *) {}
 }
 #endif
-// Whether NativeAdrenoMetal.clients names this process (names separated by blanks, commas or new lines; "*" names every process; a
-// name that ends in "*" names every process whose name starts with it, so "com.apple.WebKit.*" covers the WebContent, Networking
-// and GPU service processes).
+// Whether NativeAdrenoMetal.clients names this process (names separated by blanks, commas or new lines; "*" names every process).
 static bool listedClient() {
     char path[1024];
     if (!requestedPath("NativeAdrenoMetal.clients", path, sizeof path)) return false;
@@ -151,18 +149,14 @@ static bool listedClient() {
     fclose(file);
     text[length] = 0;
     const char *self = getprogname();
-    for (char *save = nullptr, *name = strtok_r(text, " ,\t\r\n", &save); name; name = strtok_r(nullptr, " ,\t\r\n", &save)) {
+    for (char *save = nullptr, *name = strtok_r(text, " ,\t\r\n", &save); name; name = strtok_r(nullptr, " ,\t\r\n", &save))
         if (!strcmp(name, "*") || !strcmp(name, self)) return true;
-        const size_t nameLength = strlen(name);
-        if (nameLength && name[nameLength - 1] == '*' && !strncmp(name, self, nameLength - 1)) return true;
-    }
     return false;
 }
 // A listed process other than the render server: the same runtime on its own connection, with none of the render server's threads (no
 // display hand-off, telemetry, benchmark or cache export). Its shader cache lives in its own cache or temp directory.
 // The reason a client's device failed, as a text line the driver keeps per process (the render server's report row is rewritten every ten seconds):
 // "<step> <detail>", through the marker stream (a connection is not needed). The Gpu object is made only on this path.
-static unsigned gClientPort;
 static void clientFailure(unsigned port, const char *step, const char *detail) {
     if (Gpu *gpu = makeGpu(port)) {
         char text[64];
@@ -202,15 +196,6 @@ static id clientDevice(unsigned port) {
         if (!device && !lastError[0]) lastError = nmb_last_error();
     }
     if (!device) clientFailure(port, usable ? "no-device" : "no-cachedir", lastError);
-    // The client's first problem, once, on the same text line, sent from the thread that hit it: WidgetRenderer crashed on a nil render
-    // encoder with no reason anywhere readable (its own log lines need the plugin's format strings, which the device does not keep), and a
-    // once-a-second reader never ran before the crash (i568).
-    if (device) {
-        gClientPort = port;
-        native_bridge_metal_problem_hook = [](const char *problem) {clientFailure(gClientPort, "problem", problem);};
-        char problem[200] = {};
-        if (native_bridge_metal_first_problem(problem, sizeof problem) && problem[0]) clientFailure(port, "problem", problem);
-    }
     return device;
 }
 static id deviceForPort(unsigned port) {
@@ -383,15 +368,11 @@ static id deviceForPort(unsigned port) {
             return nullptr;
         }, gpu);
 #endif
-        // The cache export worker starts when the bundle has an explicit export request.
-        char exportPath[1024];
-        if (requestedPath("NativeAdrenoMetal.cacheexport", exportPath, sizeof exportPath)) {
-            pthread_t exporter;
-            pthread_create(&exporter, &attributes, [](void *arg) -> void * {
-                cacheexport::run(*static_cast<Gpu *>(arg), gCacheDirectory);
-                return nullptr;
-            }, gpu);
-        }
+        pthread_t exporter;
+        pthread_create(&exporter, &attributes, [](void *arg) -> void * {
+            cacheexport::run(*static_cast<Gpu *>(arg), gCacheDirectory);
+            return nullptr;
+        }, gpu);
         // Every Metal library of the OS through the runtime, 90 s after the render server opened the device (PrimeShaders.h); the boots that froze
         // or crashed before three minutes never primed anything. Progress is kept in the Data cache directory, so later boots resume.
         // The translator recurses deeply on large functions: give it the stack of a main thread.

@@ -8,7 +8,6 @@
 #include <dlfcn.h>
 #include <mach/mach.h>
 #include <pthread.h>
-#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -43,7 +42,6 @@ struct Gpu {
     uint32_t selector = 0;
     unsigned admitted = 0;
     uint64_t lastTicks = 0;
-    uint32_t abiVersion = 0;
     unsigned port = 0;
     IOServiceOpenFn openFn = nullptr;
     IOServiceCloseFn closeFn = nullptr;
@@ -73,40 +71,14 @@ struct Gpu {
         return status;
     }
     int method(uint32_t m, const void *in, size_t is, void *out, size_t os) {
-        if (m == NativeAdrenoMethodSubmit) {
-            if (!abiVersion) {
-                NativeAdrenoAbiParams params = {};
-                int status = method(NativeAdrenoMethodQuery, nullptr, 0, &params, sizeof params);
-                if (status) {
-                    return status;
-                }
-            }
-
-            const unsigned limit = abiVersion == 1 || mailbox ? 16 : NativeAdrenoAbiMaxBuffers;
-            const size_t bytes = offsetof(NativeAdrenoAbiSubmit, buffers) + limit * sizeof(NativeAdrenoAbiSubmitBuffer);
-            if (!in || is < bytes || ((const NativeAdrenoAbiSubmit *)in)->buffer_count > limit) {
-                return -1;
-            }
-
-            is = bytes;
-        }
-
+        if (mailbox) return mailboxMethod(m, in, is, out, os);
         uint8_t buffer[8 + sizeof(NativeAdrenoAbiSubmit)];
         if (is > sizeof(NativeAdrenoAbiSubmit)) return -1;
         const uint32_t header[2] = {kTunnelMagic, m};
         memcpy(buffer, header, 8);
         if (is) memcpy(buffer + 8, in, is);
         size_t o = os;
-        const int status = mailbox ? mailboxMethod(m, in, is, out, os) :
-            call(conn, selector, buffer, 8 + is, os ? out : nullptr, os ? &o : nullptr);
-        if (!status && m == NativeAdrenoMethodQuery && out && os >= sizeof(NativeAdrenoAbiParams)) {
-            abiVersion = ((const NativeAdrenoAbiParams *)out)->abi_version;
-            if (abiVersion != 1 && abiVersion != 2) {
-                return -1;
-            }
-        }
-
-        return status;
+        return call(conn, selector, buffer, 8 + is, os ? out : nullptr, os ? &o : nullptr);
     }
     // No selector is admitted: use the mailbox page (IOConnectMapMemory64 is not covered by the selector filter).
     bool openMailbox() {
