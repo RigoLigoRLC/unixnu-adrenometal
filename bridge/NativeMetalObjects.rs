@@ -171,6 +171,26 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
     })
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_kernel_cache_maintenance(device: *const NmbDevice) -> bool {
+    guard(false, || {
+        let device = &get(device)?.0;
+        let Some(address) = device.device_proc_addr(c"vkNativeAdrenoDeviceCacheMaintenance") else {
+            return Ok(false);
+        };
+
+        // The driver exposes this query only for its negotiated kernel contract.
+        // The borrowed Vulkan device remains owned by the runtime throughout the call.
+        let supported = device.with_loader_word(|| unsafe {
+            let query: unsafe extern "system" fn(ash::vk::Device) -> ash::vk::Bool32 =
+                std::mem::transmute(address);
+            query(device.raw().device.handle())
+        });
+
+        Ok(supported != 0)
+    })
+}
+
 // What the runtime says through the device's sink, kept as numbers for the plugin's telemetry: each render VkPipeline making the
 // creation log (METAL2VULKAN_LOG_PIPELINES) reports ("... made in <ms> ms[ after waiting <ms> ms for its turn]"), and the other
 // messages by severity with the last warning's text.
@@ -607,6 +627,20 @@ pub extern "C" fn nmb_buffer_contents(buffer: *const NmbBuffer) -> *mut c_void {
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_buffer_length(buffer: *const NmbBuffer) -> u64 {
     guard(0, || Ok(get(buffer)?.0.length()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_buffer_did_modify_range(buffer: *const NmbBuffer, offset: u64, length: u64) -> bool {
+    guard(false, || {
+        let buffer = &get(buffer)?.0;
+        let end = offset.checked_add(length).ok_or("modified buffer range overflow")?;
+        if end > buffer.length() {
+            return Err("modified range exceeds the buffer".into());
+        }
+
+        buffer.did_modify_range(offset..end).map_err(e("modified buffer range"))?;
+        Ok(true)
+    })
 }
 
 #[unsafe(no_mangle)]

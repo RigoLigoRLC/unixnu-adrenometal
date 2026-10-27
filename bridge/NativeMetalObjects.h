@@ -35,6 +35,9 @@ const void *nmb_function_constant_air(size_t *length);
 /* loader: a library exporting vkGetInstanceProcAddr (Turnip on the tablet). cache: a writable directory for translated shaders. */
 NmbDevice *nmb_device_open(const char *loader, const char *cache);
 void nmb_device_release(NmbDevice *);
+/* True when this device's kernel completes imported-memory cache maintenance
+ * before GPU execution and before reporting command completion. */
+bool nmb_device_kernel_cache_maintenance(const NmbDevice *);
 size_t nmb_device_name(const NmbDevice *, char *out, size_t size);
 uint64_t nmb_device_max_buffer_length(const NmbDevice *);
 // Pipeline makings (count, total us, longest us, waited us, failed), sink messages (info, warning+), shader cache hits/misses/writes.
@@ -71,6 +74,7 @@ NmbBuffer *nmb_buffer_new_no_copy_releasing(NmbDevice *, void *pointer, uint64_t
 void nmb_buffer_release(NmbBuffer *);
 void *nmb_buffer_contents(const NmbBuffer *);
 uint64_t nmb_buffer_length(const NmbBuffer *);
+bool nmb_buffer_did_modify_range(const NmbBuffer *, uint64_t offset, uint64_t length);
 uint64_t nmb_buffer_gpu_address(const NmbBuffer *);
 
 struct NmbTextureDescriptor {
