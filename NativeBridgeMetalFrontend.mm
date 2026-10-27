@@ -28,7 +28,7 @@
 extern "C" void sys_dcache_flush(void *start, size_t length);
 
 static NmbDevice *gDevice;
-static bool gKernelCacheMaintenance;
+static bool gDeviceHostCoherent;
 static id gDeviceObject;
 static uint64_t gRegistryID;
 static NSString *gName;
@@ -276,7 +276,7 @@ NB_RESOURCE_SPI
 // range once; no address identity or decision is carried into another phase
 // or command, and distinct/partially overlapping ranges retain their calls.
 static void flushSurfaces(NSMutableSet *surfaces) {
- if(gKernelCacheMaintenance) {
+ if(gDeviceHostCoherent) {
   return;
  }
 
@@ -584,7 +584,9 @@ static void waitForResource(id resource) {
 - (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {
  if(texture && ![(id)texture isKindOfClass:[NBTexture class]]){[_commandBuffer refuse:@"foreign texture"];return;}
  if(texture)[_commandBuffer.resourceOwners addObject:texture];
- if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
+ if(!gDeviceHostCoherent && texture && [(NBTexture *)texture surface]) {
+  [_commandBuffer.surfaces addObject:texture];
+ }
  [self check:nmb_encoder_set_texture(_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"];
 }
 - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {
@@ -755,7 +757,9 @@ static void waitForResource(id resource) {
   id o=objects[i];
   if(![o isKindOfClass:[NBTexture class]]){[self.commandBuffer refuse:@"missing or foreign blit texture"];return false;}
   [self.commandBuffer.resourceOwners addObject:o];
-  if([(NBTexture *)o surface])[self.commandBuffer.surfaces addObject:o];
+  if(!gDeviceHostCoherent && [(NBTexture *)o surface]) {
+   [self.commandBuffer.surfaces addObject:o];
+  }
  }
  return true;
 }
@@ -806,7 +810,14 @@ static void completed(void *context);
 static void scheduled(void *context);
 @implementation NBCommandBuffer
 - (instancetype)init {
- if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
+ if((self=[super init])) {
+  _scheduledHandlers=[NSMutableArray array];
+  _completedHandlers=[NSMutableArray array];
+  _surfaces=gDeviceHostCoherent?nil:[NSMutableSet set];
+  _resourceOwners=[NSMutableSet set];
+  _handlers=dispatch_group_create();
+  _schedulingHandlers=dispatch_group_create();
+ }
  if(self)createdUs=nowUs();
  return self;
 }
@@ -871,7 +882,10 @@ static void scheduled(void *context);
  auto attachment=[&](MTLRenderPassAttachmentDescriptor *a,NmbPassAttachment &out)->bool {
   if(!a.texture)return true;
   if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;
-  NBTexture *texture=(NBTexture *)a.texture;if(texture.surface)[_surfaces addObject:texture];
+  NBTexture *texture=(NBTexture *)a.texture;
+  if(!gDeviceHostCoherent && texture.surface) {
+   [_surfaces addObject:texture];
+  }
   [_resourceOwners addObject:texture];
   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
   return true;
@@ -939,7 +953,7 @@ static void scheduled(void *context);
  run();
 }
 // Completion releases retained resources and then delivers completed handlers.
-// Drivers without kernel cache maintenance need the frontend surface flush first.
+// The frontend flushes surfaces only when the driver requires CPU cache operations here.
 - (void)finish {
  flushSurfaces(_surfaces);
  // Actual GPU completion (or a local refusal that never submitted) is the
@@ -1566,7 +1580,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  gMissing=missing;gInFlight=[NSMutableSet set];
  gDevice=nmb_device_open(loader,cache);
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
- gKernelCacheMaintenance=nmb_device_kernel_cache_maintenance(gDevice);
+ gDeviceHostCoherent=nmb_device_host_coherent(gDevice);
  if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
  // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
@@ -1725,7 +1739,7 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  row("J completed wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeWaitCompleted.count.load(),ms(gTimeWaitCompleted.total.load()),ms(gTimeWaitCompleted.slowest.load()));
  row("J resource wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeResourceWait.count.load(),ms(gTimeResourceWait.total.load()),ms(gTimeResourceWait.slowest.load()));
  row("J resource checks=%llu skipped=%llu",(unsigned long long)gResourceChecks.load(),(unsigned long long)gResourceSkipped.load());
- row("J surface cache kernel=%u n=%llu bytes=%llu dup=%llu us=%llu max=%llu",gKernelCacheMaintenance?1U:0U,(unsigned long long)gTimeSurfaceFlush.count.load(),
+ row("J surface cache driver=%u n=%llu bytes=%llu dup=%llu us=%llu max=%llu",gDeviceHostCoherent?1U:0U,(unsigned long long)gTimeSurfaceFlush.count.load(),
   (unsigned long long)gSurfaceFlushBytes.load(),(unsigned long long)gSurfaceFlushDuplicates.load(),
   (unsigned long long)gTimeSurfaceFlush.total.load(),(unsigned long long)gTimeSurfaceFlush.slowest.load());
  row("N no-copy %llu dealloc %llu/%llu surface %llu/%llu",(unsigned long long)gNoCopyAll.load(),(unsigned long long)gNoCopyReleased.load(),

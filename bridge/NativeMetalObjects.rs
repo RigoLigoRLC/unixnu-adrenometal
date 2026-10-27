@@ -172,23 +172,28 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn nmb_device_kernel_cache_maintenance(device: *const NmbDevice) -> bool {
-    guard(false, || {
-        let device = &get(device)?.0;
-        let Some(address) = device.device_proc_addr(c"vkNativeAdrenoDeviceCacheMaintenance") else {
-            return Ok(false);
-        };
+pub extern "C" fn nmb_device_host_coherent(device: *const NmbDevice) -> bool {
+    guard(false, || Ok(device_host_coherent(&get(device)?.0)))
+}
 
-        // The driver exposes this query only for its negotiated kernel contract.
-        // The borrowed Vulkan device remains owned by the runtime throughout the call.
-        let supported = device.with_loader_word(|| unsafe {
-            let query: unsafe extern "system" fn(ash::vk::Device) -> ash::vk::Bool32 =
-                std::mem::transmute(address);
-            query(device.raw().device.handle())
-        });
+/// The device query reports whether submission and completion make imported CPU
+/// pages visible through hardware coherence or cache operations in the kernel.
+pub(super) fn device_host_coherent(device: &Device) -> bool {
+    let address = device
+        .device_proc_addr(c"vkNativeAdrenoDeviceHostCoherent")
+        .or_else(|| device.device_proc_addr(c"vkNativeAdrenoDeviceCacheMaintenance"));
+    let Some(address) = address else {
+        return false;
+    };
 
-        Ok(supported != 0)
-    })
+    // The runtime owns the Vulkan device and scopes the loader context to this call.
+    let supported = device.with_loader_word(|| unsafe {
+        let query: unsafe extern "system" fn(ash::vk::Device) -> ash::vk::Bool32 =
+            std::mem::transmute(address);
+        query(device.raw().device.handle())
+    });
+
+    supported != 0
 }
 
 // What the runtime says through the device's sink, kept as numbers for the plugin's telemetry: each render VkPipeline making the

@@ -1,5 +1,5 @@
 diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
-index de3df1e..d196e88 100644
+index de3df1e..eb8404f 100644
 --- a/crates/metal2vulkan-runtime/src/memory.rs
 +++ b/crates/metal2vulkan-runtime/src/memory.rs
 @@ -37,16 +37,14 @@ use super::buffer::usage;
@@ -21,7 +21,45 @@ index de3df1e..d196e88 100644
  
  /// The size of a pooled block, at most the device's `maxMemoryAllocationSize`.
  pub(super) const BLOCK_BYTES: u64 = 64 << 20;
-@@ -646,11 +644,17 @@ impl Placement {
+@@ -64,7 +62,8 @@ pub(super) enum MemoryClass {
+     /// function table's words): without unified memory device-local where the device has such
+     /// (resizable BAR), else as `Shared`; with unified memory as `Shared` ([`candidates`]).
+     WriteCombined,
+-    /// Device-local (`Private` storage), host-invisible where the device has a choice.
++    /// Device-local (`Private` storage). Unified-memory devices prefer host-cached,
++    /// coherent memory; discrete devices prefer memory the host cannot map.
+     Private,
+     /// Host-visible and coherent (`Managed` storage), host-cached where the device has such
+     /// memory: a managed resource is there for the CPU to read back. On a device with unified
+@@ -205,6 +204,9 @@ pub(super) fn host_cached_placement(
+ /// announces it (`Degradation::SharedInSystemMemory`). So without unified memory
+ /// `WriteCombined` memory, which the host does not read, prefers a device-local type; with
+ /// unified memory it is `Shared` memory.
++/// `Private` resources and heaps on unified-memory devices prefer the same cached,
++/// coherent device-local memory. A memoryless attachment first prefers lazy allocation,
++/// then cached coherent memory when the device allocates its backing eagerly.
+ pub(super) fn candidates(
+     types: &[vk::MemoryType],
+     allowed: u32,
+@@ -226,7 +228,17 @@ pub(super) fn candidates(
+             [P::HOST_CACHED, P::DEVICE_LOCAL],
+             P::empty(),
+         ),
++        MemoryClass::Private if unified => (
++            P::DEVICE_LOCAL,
++            [P::HOST_CACHED | P::HOST_COHERENT, P::empty()],
++            P::empty(),
++        ),
+         MemoryClass::Private => (P::DEVICE_LOCAL, [P::empty(); 2], P::HOST_VISIBLE),
++        MemoryClass::Memoryless if unified => (
++            P::DEVICE_LOCAL,
++            [P::LAZILY_ALLOCATED, P::HOST_CACHED | P::HOST_COHERENT],
++            P::empty(),
++        ),
+         MemoryClass::Memoryless => (
+             P::DEVICE_LOCAL,
+             [P::LAZILY_ALLOCATED, P::empty()],
+@@ -646,11 +658,17 @@ impl Placement {
      }
  }
  
@@ -40,7 +78,7 @@ index de3df1e..d196e88 100644
      block_bytes: u64,
      /// Blocks are allocated with `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT`: the device enabled
      /// `bufferDeviceAddress`, so buffers carry device addresses.
-@@ -688,6 +692,9 @@ impl Memory {
+@@ -688,6 +706,9 @@ impl Memory {
              pools: (types.iter().chain(&types))
                  .map(|_| Pool::default())
                  .collect(),
@@ -50,7 +88,7 @@ index de3df1e..d196e88 100644
              types,
              block_bytes: BLOCK_BYTES.min(max_allocation.max(1)),
              device_address,
-@@ -1348,9 +1355,9 @@ pub(super) fn allocate_addressed(
+@@ -1348,9 +1369,9 @@ pub(super) fn allocate_addressed(
  
  /// [`allocate`], in a block with a buffer of addresses where `addressed` gives the counts of the
  /// buffers of addresses made, of the blocks that hold `holds`, pooled or in a block of its own
@@ -63,7 +101,7 @@ index de3df1e..d196e88 100644
  fn place(
      memory: &Mutex<Memory>,
      device: &ash::Device,
-@@ -1385,6 +1392,24 @@ fn place(
+@@ -1385,6 +1406,24 @@ fn place(
                  return Ok(placement);
              }
          }
@@ -88,7 +126,7 @@ index de3df1e..d196e88 100644
          match maker.make(device, type_index, block_size, addressed) {
              Ok(block) => {
                  let mut memory = lock(memory);
-@@ -1404,7 +1429,8 @@ fn place(
+@@ -1404,7 +1443,8 @@ fn place(
  /// that an encoding or a commit, which must wait for no other process's GPU work, finds a block
  /// with room rather than making one. A block of buffers gets its buffer of addresses (counted in
  /// `counts`) where blocks carry one. A block that fails to be made, or a pool the query fails for,
@@ -98,7 +136,7 @@ index de3df1e..d196e88 100644
  pub(super) fn keep_room(memory: &Mutex<Memory>, device: &ash::Device, counts: &Counters) {
      let (lacking, maker) = {
          let mut memory = lock(memory);
-@@ -1418,6 +1444,22 @@ pub(super) fn keep_room(memory: &Mutex<Memory>, device: &ash::Device, counts: &C
+@@ -1418,6 +1458,22 @@ pub(super) fn keep_room(memory: &Mutex<Memory>, device: &ash::Device, counts: &C
          (lacking, memory.maker())
      };
      for pool in lacking {

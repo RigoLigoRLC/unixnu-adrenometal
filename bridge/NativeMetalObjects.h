@@ -35,9 +35,9 @@ const void *nmb_function_constant_air(size_t *length);
 /* loader: a library exporting vkGetInstanceProcAddr (Turnip on the tablet). cache: a writable directory for translated shaders. */
 NmbDevice *nmb_device_open(const char *loader, const char *cache);
 void nmb_device_release(NmbDevice *);
-/* True when this device's kernel completes imported-memory cache maintenance
- * before GPU execution and before reporting command completion. */
-bool nmb_device_kernel_cache_maintenance(const NmbDevice *);
+/* True when submission and completion make imported CPU pages visible through
+ * hardware coherence or cache operations owned by the kernel. */
+bool nmb_device_host_coherent(const NmbDevice *);
 size_t nmb_device_name(const NmbDevice *, char *out, size_t size);
 uint64_t nmb_device_max_buffer_length(const NmbDevice *);
 // Pipeline makings (count, total us, longest us, waited us, failed), sink messages (info, warning+), shader cache hits/misses/writes.

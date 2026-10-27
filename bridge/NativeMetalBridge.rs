@@ -185,11 +185,13 @@ fn render(device: &Device, library: &metal2vulkan_runtime::Library) -> Result<u3
 }
 
 /// The IOSurface path without an IOSurface: page-aligned host pages imported without a copy (the kernel pins them, Turnip maps
-/// them into the GPU), a linear render target over them, CPU caches cleaned before and invalidated after the GPU's use.
+/// them into the GPU) and a linear render target over them. The driver reports
+/// whether submission and completion provide CPU/GPU visibility for the imported pages.
 fn import(device: &Device, library: &metal2vulkan_runtime::Library) -> Result<u32, String> {
     const SIDE: u64 = 64;
     const ROW: u64 = 256;
     let bytes = (ROW * SIDE) as usize;
+    let host_coherent = objects::device_host_coherent(device);
     // SAFETY: an anonymous private mapping of whole pages, unmapped below after every GPU use completed.
     let pages = unsafe {
         libc::mmap(std::ptr::null_mut(), bytes, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0)
@@ -209,11 +211,15 @@ fn import(device: &Device, library: &metal2vulkan_runtime::Library) -> Result<u3
         texture.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
         texture.resource_options = ResourceOptions::shared();
         let target = buffer.new_texture(&texture, 0, ROW).map_err(|e| format!("texture over pages: {e:?}"))?;
-        // SAFETY: the range is this mapping.
-        unsafe { sys_dcache_flush(pages, bytes) };
+        if !host_coherent {
+            // SAFETY: the range is this mapping.
+            unsafe { sys_dcache_flush(pages, bytes) };
+        }
         draw_quad(device, library, &target, None)?;
-        // SAFETY: the GPU finished writing; drop any line the CPU fetched meanwhile.
-        unsafe { sys_dcache_flush(pages, bytes) };
+        if !host_coherent {
+            // SAFETY: the GPU finished writing; drop any line the CPU fetched meanwhile.
+            unsafe { sys_dcache_flush(pages, bytes) };
+        }
         // SAFETY: the pages hold `bytes` bytes and no command buffer writes them now.
         let view = unsafe { std::slice::from_raw_parts(pages as *const u8, bytes) };
         let bad = wrong_texels(view, ROW as usize, SIDE as usize);
