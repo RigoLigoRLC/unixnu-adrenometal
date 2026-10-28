@@ -180,7 +180,7 @@ index 0863fd5..ead9f9b 100644
              let used = self
                  .residency
 diff --git a/crates/metal2vulkan-runtime/src/encoder.rs b/crates/metal2vulkan-runtime/src/encoder.rs
-index 1194f78..cd40161 100644
+index 1194f78..fff6022 100644
 --- a/crates/metal2vulkan-runtime/src/encoder.rs
 +++ b/crates/metal2vulkan-runtime/src/encoder.rs
 @@ -524,6 +524,7 @@ impl EncoderCore {
@@ -199,23 +199,7 @@ index 1194f78..cd40161 100644
          self.touch_reaching(uses, resident);
          Ok(())
      }
-@@ -723,6 +725,15 @@ impl EncoderCore {
-             .after(shadows, aliased.as_deref().unwrap_or(uses));
-     }
- 
-+    /// The completed shadow plan returns its final copies without recording them. A deferred
-+    /// render pass records these after its attachment stores and resolves.
-+    pub(super) fn finish_shadow_plan(&mut self) -> Vec<ShadowCopy> {
-+        let copies = self.shadows.finish();
-+        let texels = copies.iter().map(ShadowCopy::texels_back).sum();
-+        self.device().shared().counts.shadow_copies_planned(copies.len(), texels);
-+        copies
-+    }
-+
-     /// Record shadowed textures' `copies` as commands of the encoder: ordered as any command
-     /// is, in an encoder Metal orders; with a barrier from everything before and one to
-     /// everything after each copy, in one whose commands Metal leaves unordered.
-@@ -749,6 +760,7 @@ impl EncoderCore {
+@@ -749,6 +751,7 @@ impl EncoderCore {
                  let aliased = self.aliased(&uses);
                  self.uses
                      .record(stages, aliased.as_deref().unwrap_or(&uses), None);
@@ -223,7 +207,7 @@ index 1194f78..cd40161 100644
                  self.touch(&uses);
              }
          }
-@@ -760,6 +772,22 @@ impl EncoderCore {
+@@ -760,6 +763,22 @@ impl EncoderCore {
          self.replaying
      }
  
@@ -423,306 +407,10 @@ index 3553b11..347153a 100644
              if let Some(used) = self.residency.use_resource(resource, usage, stages) {
                  self.core.retain(used);
 diff --git a/crates/metal2vulkan-runtime/src/render/executions.rs b/crates/metal2vulkan-runtime/src/render/executions.rs
-index 458c571..41eb130 100644
+index 458c571..825e65c 100644
 --- a/crates/metal2vulkan-runtime/src/render/executions.rs
 +++ b/crates/metal2vulkan-runtime/src/render/executions.rs
-@@ -53,10 +53,9 @@
- //!   whose addresses resolve against the resources the command buffer's encoders made resident,
- //!   every encoder's, before the call or after it (`residency.rs`), then against the device's live
- //!   buffers Metal reaches unnamed (`live_buffers.rs`), as a compute command's do; its functions
--//!   reach those resources too. Where the pass has a shadowed texture, an execution its command
--//!   buffer made more resident than its encoder had at the call is refused
--//!   (`NotImplemented(IndirectRenderCommands)`): the copies around the pass's instances follow what
--//!   the call gathered (`render/shadows.rs`). An address in none of them (a no-copy buffer or a
-+//!   reach those resources too. Shadow copies are planned at commit from that same complete
-+//!   residency, before the attachment preparation, between instances, and after the final
-+//!   attachment stores (`render/deferred_shadows.rs`). An address in none of them (a no-copy buffer or a
- //!   heap's buffer no command buffer's commands used yet) misses (the slot unbound, reading zero,
- //!   counted in the execution report), and an unset buffer reads zero, as Metal's did. A command
- //!   with no draw, no pipeline state, no vertices, indices, patches or instances runs nothing, and
-@@ -162,9 +161,10 @@
- //!   pass renders it into a backing from its first instance on, as the encoder's own instances keep
- //!   it in a stand-in from a split on: an image of the pass held until the command buffer
- //!   completes, announced as the encoder's (`memoryless-backed`), each instance that runs as
--//!   several taking a framebuffer of it. Where the pass reads such an attachment past its instances
--//!   (its sample planes, a color resolve drawn after the pass, a depth/stencil resolve), the commit
--//!   is refused `NotImplemented(IndirectRenderCommands)`.
-+//!   several taking a framebuffer of it. A resolving memoryless color receives its backing
-+//!   before the first draw binds input attachments or color-format views. Sample-plane and
-+//!   depth/stencil sources receive theirs before the encoder plans copies and resolves. Every
-+//!   deferred execution's captured layout refers to those same backing images.
- //! - **A fetched attachment's stand-in or sample planes** (EVs RFL-inst-m3 and -m4). A run whose
- //!   draws read and write attachments in the pixel interlock elsewhere than the pass's instances
- //!   render them has its steps around it (`RunSteps`), as the encoder's instances of such draws do
-@@ -270,6 +270,7 @@ use crate::buffer::Buffer;
- use crate::command_buffer::CommandBuffer;
- use crate::degradation::{Degradation, SplitCauses};
- use crate::device::lock;
-+use crate::deferred::Deferred;
- use crate::encoder::{EncoderCore, RecordedSegment};
- use crate::error::{internal, invalid, vulkan, Error, Problem, RuntimeGap};
- use crate::executed_commands::{ExecutedCommand, RecordsRead};
-@@ -303,8 +304,8 @@ use metal2vulkan::metal::{
- use metal2vulkan::pipeline::VertexStride;
- use std::borrow::Cow;
- use std::collections::{BTreeMap, BTreeSet};
--use std::ops::Range;
--use std::sync::{Arc, OnceLock};
-+use std::ops::{Deref, Range};
-+use std::sync::{Arc, Mutex, OnceLock};
- 
- mod ahead;
- 
-@@ -375,7 +376,7 @@ impl RenderCommandEncoder {
-             Inherited::Encoder(state) => Some(state),
-         };
-         self.degrade_repeated_start(icb, &range);
--        self.defer_execution(icb, ExecutionRange::Fixed(range), pipeline)
-+        self.defer_execution(icb, ExecutionRange::Fixed(range), pipeline, None)
-     }
- 
-     /// `executeCommandsInBuffer:indirectBuffer:indirectBufferOffset:`: run the render commands
-@@ -397,10 +398,9 @@ impl RenderCommandEncoder {
-     /// range buffer of another device, and a range Metal's reading of is not defined (`Invalid`,
-     /// `IndirectCommandBufferProblem::RangeBuffer`): an offset that is not a multiple of 4 bytes,
-     /// at which Metal's GPU faulted, or 8 bytes that run past `range_buffer`, which Metal reads
--    /// from whatever follows it. A range a draw of the encoder
--    /// before the call may write is `NotImplemented(IndirectRenderCommands)`: Metal's execution
--    /// reads that draw's write, where the runtime's copy, made before the pass, would not; as for
--    /// the index bounds pass, an untracked buffer's writes are not seen. Under an inherited state
-+    /// from whatever follows it. A range an earlier draw may write is copied after that draw's
-+    /// render pass instance. The following submission reads the completed copy and records the
-+    /// execution with the same attachments and visibility offset. Under an inherited state
-     /// made without `supportIndirectCommandBuffers`, whatever the range, `{0, 0}` included, the
-     /// encoder faults as `execute_commands_in_buffer`'s does (EVs CFR-probe1-m4,
-     /// IRX-xfault1-m4 `indirect_empty_nosupport`, `indirect_one_nosupport`).
-@@ -428,16 +428,22 @@ impl RenderCommandEncoder {
-             range_buffer,
-             offset..offset + indirect_execute::RANGE_BYTES,
-         )];
--        if self.core.uses().written(&read) {
--            return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands));
--        }
--        let copy = indirect_dispatch::copy_arguments(
--            &mut self.core,
--            range_buffer,
--            offset,
--            indirect_execute::RANGE_BYTES,
--        )?;
--        self.defer_execution(icb, ExecutionRange::Indirect(copy), pipeline)
-+        let (copy, source) = if self.core.uses().written(&read) || !self.executions.is_empty() {
-+            let copy = self.core.device().own_buffer(
-+                32,
-+                crate::values::ResourceOptions::shared(),
-+            )?;
-+            (copy, Some((range_buffer.clone(), offset)))
-+        } else {
-+            let copy = indirect_dispatch::copy_arguments(
-+                &mut self.core,
-+                range_buffer,
-+                offset,
-+                indirect_execute::RANGE_BYTES,
-+            )?;
-+            (copy, None)
-+        };
-+        self.defer_execution(icb, ExecutionRange::Indirect(copy), pipeline, source)
-     }
- 
-     /// The pipeline state an execution of `icb` here runs with (`Inherited`). Where the
-@@ -491,6 +497,7 @@ impl RenderCommandEncoder {
-         icb: &IndirectCommandBuffer,
-         range: ExecutionRange,
-         pipeline: Option<RenderPipelineState>,
-+        range_source: Option<(Buffer, u64)>,
-     ) -> Result<(), Error> {
-         self.sync_heaps();
-         // An execution rewrites an extended-range or padded attachment as a draw does, of reset
-@@ -528,6 +535,9 @@ impl RenderCommandEncoder {
-         // gives none, and a command's draw that needs them is refused as before
-         // (`hidden_depth_stencil`); an execution of no such draw runs.
-         let hidden = self.needed_hidden().ok().flatten();
-+        if range_source.is_some() || (icb.gpu_written() && self.current.recorded) {
-+            self.barrier = true;
-+        }
-         // The commands draw into an instance of no fetched attachments, shader-side stencil or
-         // views: the current one where it is such an instance and no tile dispatch or memory
-         // barrier follows it, else a new one, as a draw of such a pipeline records.
-@@ -663,6 +673,7 @@ impl RenderCommandEncoder {
-             snapshot,
-             shadows,
-             lent,
-+            range_source,
-         });
-         // Its commands may name any pipeline state, reading handles in any stage.
-         self.command_encoded(every_render_stage());
-@@ -703,6 +714,8 @@ pub(crate) struct RenderExecution {
-     icb: IndirectCommandBuffer,
-     /// The commands it runs: a range inside the buffer's size, or one read from a buffer.
-     range: ExecutionRange,
-+    /// The original execution range when a previous instance must finish before its copy.
-+    range_source: Option<(Buffer, u64)>,
-     /// The encoder's pipeline state where the buffer inherits it.
-     pipeline: Option<RenderPipelineState>,
-     /// The encoder as the call found it.
-@@ -829,6 +842,7 @@ fn framed_layout<'a>(own: &'a PassLayout, framed: &[(usize, Target)]) -> Cow<'a,
- /// depth and stencil (`bare`): as the encoder ended it, and from the first execution whose
- /// commands ran as several on, with the backings of its memoryless attachments in their place
- /// (`backed`).
-+#[derive(Clone)]
- struct Rendered {
-     layout: PassLayout,
-     bare: Option<PassLayout>,
-@@ -847,6 +861,96 @@ struct Backing {
-     own: Target,
- }
- 
-+/// Input-attachment descriptors and color-format views retain their image when a draw is
-+/// encoded. Resolving memoryless colors receive the queue's backing before the first draw so
-+/// those descriptors remain valid if an ICB later splits the pass or a shader resolves it.
-+pub(super) fn prepare_memoryless_color_reads(
-+    maker: &CommandBuffer,
-+    layout: &mut PassLayout,
-+) -> Result<(), Error> {
-+    for color in layout.colors.iter_mut().flatten() {
-+        if color.resolve.is_some() || color.copied_resolve.is_some() || color.late_store {
-+            let _ = prepare_memoryless_backing(maker, &mut color.target, &mut color.stand_in)?;
-+        }
-+    }
-+    Ok(())
-+}
-+
-+/// Memoryless attachments read by sample-plane copies or resolves use one backing across all
-+/// render instances and deferred executions. The encoder fixes these images after settling store
-+/// actions and before planning descriptors, copies and framebuffers.
-+pub(super) fn back_memoryless_attachments(
-+    maker: &CommandBuffer,
-+    layout: &mut PassLayout,
-+    executions: &mut [RenderExecution],
-+) -> Result<(), Error> {
-+    if executions.is_empty() {
-+        return Ok(());
-+    }
-+    let mut backed = Vec::new();
-+    for (index, color) in layout.colors.iter_mut().enumerate() {
-+        let Some(color) = color else {
-+            continue;
-+        };
-+        if color.planes.is_none() && color.resolve.is_none() && color.copied_resolve.is_none() {
-+            continue;
-+        }
-+        if let Some(own) = prepare_memoryless_backing(maker, &mut color.target, &mut color.stand_in)? {
-+            backed.push(Backing {
-+                index: Some(index),
-+                target: color.target.clone(),
-+                own,
-+            });
-+        }
-+    }
-+    if let Some(ds) = layout.depth_stencil.as_mut().filter(|ds| ds.resolve.is_some()) {
-+        if let Some(own) = prepare_memoryless_backing(maker, &mut ds.target, &mut ds.stand_in)? {
-+            backed.push(Backing {
-+                index: None,
-+                target: ds.target.clone(),
-+                own,
-+            });
-+        }
-+    }
-+    for execution in executions {
-+        back(&mut execution.snapshot.layout, &backed)?;
-+    }
-+    Ok(())
-+}
-+
-+/// The attachment's backing receives sample-plane and resolve reads after its render instances.
-+/// An existing stand-in remains the attachment's source; an unbacked memoryless image receives
-+/// the texture's retained backing for this queue and subresource.
-+fn prepare_memoryless_backing(
-+    maker: &CommandBuffer,
-+    target: &mut Target,
-+    stand_in: &mut Option<StandIn>,
-+) -> Result<Option<Target>, Error> {
-+    match stand_in {
-+        Some(held) if held.cause == Cause::Backing && super::memoryless(&held.own) => {
-+            return Ok(Some(held.own.clone()));
-+        }
-+        Some(_) => return Ok(None),
-+        None => {}
-+    }
-+    if !super::memoryless(target) {
-+        return Ok(None);
-+    }
-+    let own = target.clone();
-+    *target = attachment_stand_in::kept_backing(
-+        maker,
-+        &own,
-+        maker.command_queue().id(),
-+        false,
-+    )?;
-+    *stand_in = Some(StandIn {
-+        own: own.clone(),
-+        cause: Cause::Backing,
-+        area: None,
-+    });
-+    Ok(Some(own))
-+}
-+
- impl Rendered {
-     /// `layout`, an execution's at its call, with the pass's backings in place of the memoryless
-     /// attachments they back.
-@@ -865,16 +969,14 @@ impl Rendered {
-     /// into a backing from its first instance on, its own load and store actions kept, as the
-     /// encoder's own instances keep a memoryless attachment in a stand-in from a split on
-     /// (`render.rs`); and so it renders one the commands' draws rendered into a stand-in (a
--    /// split of theirs, or a fetch), into that stand-in. Refused
--    /// (`NotImplemented(IndirectRenderCommands)`) where the pass reads such an attachment past
--    /// its instances: a color one's sample planes (`planes`) or its resolve drawn after the
--    /// pass (`color_resolve.rs`), and a depth/stencil one's resolve.
-+    /// split of theirs, or a fetch), into that stand-in. Attachments consumed by sample-plane
-+    /// copies or resolves already have their backing before descriptors and framebuffers are
-+    /// planned (`back_memoryless_attachments`).
-     fn back_memoryless(
-         &mut self,
-         maker: &CommandBuffer,
-         run: &mut PassLayout,
-     ) -> Result<(), Error> {
--        let refused = || Error::NotImplemented(RuntimeGap::IndirectRenderCommands);
-         let mut backed = Vec::new();
-         for (index, color) in self.layout.colors.iter().enumerate() {
-             let Some(color) = color.as_ref().filter(|color| color.stand_in.is_none()) else {
-@@ -885,10 +987,6 @@ impl Rendered {
-             let Some(backing) = backing(maker, Some(index), &color.target, ran, self.queue)? else {
-                 continue;
-             };
--            let drawn_after = color.resolve.as_ref().is_some_and(|r| r.shader.is_some());
--            if color.planes.is_some() || drawn_after {
--                return Err(refused());
--            }
-             backed.push(backing);
-         }
-         if let Some(ds) = self.layout.depth_stencil.as_ref() {
-@@ -896,9 +994,6 @@ impl Rendered {
-             let ran = ran.map(|ran| (&ran.target, ran.stand_in.as_ref()));
-             if ds.stand_in.is_none() {
-                 if let Some(backing) = backing(maker, None, &ds.target, ran, self.queue)? {
--                    if ds.resolve.is_some() {
--                        return Err(refused());
--                    }
-                     backed.push(backing);
-                 }
-             }
-@@ -1991,9 +2086,10 @@ impl RenderExecution {
-         forms: BufferForms,
-     ) -> RenderCommandEncoder {
-         let snapshot = &self.snapshot;
--        // The draws use only the shadowed textures the call gathered.
-+        // Committed residency includes resources declared after this execution was encoded.
-         let mut shadows = InstanceShadows::default();
-         shadows.add(&self.shadows, &[]);
-+        shadows.add_residency(residency);
-         RenderCommandEncoder {
-             core,
-             earlier: Vec::new(),
-@@ -2073,6 +2169,8 @@ impl RenderExecution {
+@@ -2073,6 +2073,8 @@ impl RenderExecution {
              barrier_inside: false,
              reaches_unnamed: true,
              reload_at: std::collections::BTreeSet::new(),
@@ -731,298 +419,11 @@ index 458c571..41eb130 100644
              called: true,
              drew: true,
              drawn: crate::clear_reach::DrawnArea::unbounded(),
-@@ -2215,6 +2313,15 @@ impl RenderExecution {
- /// A pass that executes render commands, left to record as a segment of its encoder (the module
- /// docs): each instance's begin, the secondaries its subpass runs, and its end.
- pub(crate) struct DeferredPass {
-+    data: Arc<PassData>,
-+    instances_range: Range<usize>,
-+    before: Option<Arc<Mutex<Option<PassProgress>>>>,
-+    after: Arc<Mutex<Option<PassProgress>>>,
-+}
-+
-+/// PassData owns every secondary, attachment operation and execution captured by one render
-+/// encoder. DeferredPass submits consecutive instance ranges while retaining this shared data.
-+pub(crate) struct PassData {
-     instances: Vec<PassInstance>,
-     /// The steps around its instances, as the encoder's own pass records them
-     /// (`render/pass_steps.rs`): the shadowed textures' copies, the sample planes', the
-@@ -2239,14 +2346,26 @@ pub(crate) struct DeferredPass {
-     /// passes for makes its pass and framebuffer.
-     layout: PassLayout,
-     bare: Option<PassLayout>,
--    /// A shadowed texture is an attachment of the pass, or one its draws or tile dispatches use
--    /// (`render/shadows.rs`): the copies around its instances follow the bytes each execution's
--    /// call gathered.
--    shadowed: bool,
-     /// What the commit made ahead for the host step that records it (`ahead.rs`), once made.
-     ahead: OnceLock<Arc<Ahead>>,
- }
- 
-+impl Deref for DeferredPass {
-+    type Target = PassData;
-+
-+    fn deref(&self) -> &PassData {
-+        &self.data
-+    }
-+}
-+
-+/// PassProgress retains storage and memoryless attachment backings created by an earlier
-+/// submission. The next submission loads the same images after its range copy completes.
-+#[derive(Clone)]
-+struct PassProgress {
-+    storage: PassStorage,
-+    rendered: Rendered,
-+}
-+
- /// One render pass instance of a [`DeferredPass`].
- pub(super) struct PassInstance {
-     pub(super) pass: vk::RenderPass,
-@@ -2295,22 +2414,88 @@ impl DeferredPass {
-         (executions, pending): (Vec<RenderExecution>, Vec<PendingDraw>),
-         storage: PassStorage,
-         (layout, bare): (PassLayout, Option<PassLayout>),
--        shadowed: bool,
-     ) -> DeferredPass {
-+        let count = instances.len();
-         DeferredPass {
--            instances,
--            steps,
--            uses,
--            executions,
--            pending,
--            storage,
--            layout,
--            bare,
--            shadowed,
--            ahead: OnceLock::new(),
-+            data: Arc::new(PassData {
-+                instances,
-+                steps,
-+                uses,
-+                executions,
-+                pending,
-+                storage,
-+                layout,
-+                bare,
-+                ahead: OnceLock::new(),
-+            }),
-+            instances_range: 0..count,
-+            before: None,
-+            after: Arc::new(Mutex::new(None)),
-         }
-     }
- 
-+    /// Submit each group of instances before copying an execution range they may write.
-+    /// The following deferred group waits for that copy before reading its range on the CPU.
-+    pub(super) fn defer_parts(self: &Arc<Self>, core: &mut EncoderCore) -> Result<(), Error> {
-+        let mut start = 0;
-+        let mut before = None;
-+        for (index, instance) in self.instances.iter().enumerate() {
-+            let executions: Vec<_> = instance.pieces.iter().filter_map(|piece| {
-+                let Piece::Execution(at) = *piece else {
-+                    return None;
-+                };
-+                let execution = &self.executions[at];
-+                (execution.range_source.is_some() || execution.icb.gpu_written())
-+                    .then_some(execution)
-+            }).collect();
-+            if executions.is_empty() {
-+                continue;
-+            }
-+            if index > start {
-+                let part = self.part(start..index, before);
-+                before = Some(Arc::clone(&part.after));
-+                core.defer(Deferred::RenderPass(Arc::new(part)))?;
-+            }
-+            for execution in executions {
-+                if let (Some((source, offset)), ExecutionRange::Indirect(copy)) =
-+                    (&execution.range_source, &execution.range)
-+                {
-+                    indirect_dispatch::copy_arguments_into(
-+                        core,
-+                        source,
-+                        *offset,
-+                        indirect_execute::RANGE_BYTES,
-+                        copy,
-+                    );
-+                }
-+            }
-+            start = index;
-+        }
-+        let part = self.part(start..self.instances.len(), before);
-+        core.defer(Deferred::RenderPass(Arc::new(part)))
-+    }
-+
-+    fn part(
-+        &self,
-+        instances_range: Range<usize>,
-+        before: Option<Arc<Mutex<Option<PassProgress>>>>,
-+    ) -> DeferredPass {
-+        DeferredPass {
-+            data: Arc::clone(&self.data),
-+            instances_range,
-+            before,
-+            after: Arc::new(Mutex::new(None)),
-+        }
-+    }
-+
-+    fn contains_execution(&self, execution: usize) -> bool {
-+        self.instances[self.instances_range.clone()].iter().any(|instance| {
-+            instance.pieces.iter().any(|piece| {
-+                matches!(*piece, Piece::Execution(at) if at == execution)
-+            })
-+        })
-+    }
-+
-     /// Make, at the commit of `command_buffer` and on its thread, what the host step that
-     /// records the pass needs and would otherwise make on the scheduler's thread, which makes
-     /// no render pass, framebuffer or image (`creation.rs`): `ahead.rs`. Once; a part it fails
-@@ -2327,9 +2512,16 @@ impl DeferredPass {
-     /// encoder made its buffer resident for writing (`IndirectCommandBuffer::gpu_written`, for
-     /// good), or the range it reads from a buffer.
-     pub(crate) fn gpu_written(&self) -> bool {
-+        if self.before.is_some() {
-+            return true;
-+        }
-         self.executions
-             .iter()
--            .any(|execution| execution.icb.gpu_written() || execution.range.indirect())
-+            .enumerate()
-+            .any(|(at, execution)| {
-+                self.contains_execution(at)
-+                    && (execution.icb.gpu_written() || execution.range.indirect())
-+            })
-     }
- 
-     /// Whether a pipeline one of its draws records is still being made.
-@@ -2404,7 +2596,10 @@ impl DeferredPass {
-         }
-         // The first length each buffer (by its resource ID) was executed with from each command.
-         let mut first: BTreeMap<(u64, u32), usize> = BTreeMap::new();
--        for execution in &self.executions {
-+        for (at, execution) in self.executions.iter().enumerate() {
-+            if !self.contains_execution(at) {
-+                continue;
-+            }
-             let (range, _) = execution.range.commands(execution.icb.size())?;
-             if range.is_empty() {
-                 continue;
-@@ -2430,33 +2625,39 @@ impl DeferredPass {
-         if step {
-             self.degrade_repeated_start(command_buffer.device())?;
-         }
--        // The executions resolve and bind against the command buffer's resident resources,
--        // every encoder's (`residency.rs`). Where the pass has a shadowed texture, the copies
--        // around its instances were planned over the bytes each call gathered, from its
--        // encoder's resources then: one made resident beyond them is refused.
-+        // The executions and their shadow copies use the same committed residency.
-         let residency = command_buffer.residency()?;
--        if self.shadowed
--            && self
--                .executions
--                .iter()
--                .any(|execution| residency.beyond(&execution.snapshot.residency))
--        {
--            return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands));
--        }
-+        let planned_shadows = self.steps.deferred_shadows.as_ref()
-+            .map(|plan| plan.ready()).transpose()?;
-         let mut core = EncoderCore::segment(command_buffer, false)?;
-         let mut found = Found::default();
-         let mut recorded = Vec::with_capacity(self.executions.len());
--        let mut storage = self.storage.clone();
-+        let previous = self.before.as_ref().and_then(|previous| lock(previous).clone());
-+        if self.before.is_some() && previous.is_none() {
-+            return Err(internal("a render continuation before its preceding submission"));
-+        }
-+        let mut storage = previous.as_ref().map_or_else(
-+            || self.storage.clone(),
-+            |previous| previous.storage.clone(),
-+        );
-+        let initial_storage = storage.clone();
-         let mut stood = Vec::new();
-         // The pass's layout as its instances render it: its memoryless attachments backed from
-         // the first execution whose commands run as several on.
--        let mut rendered = Rendered {
--            layout: self.layout.clone(),
--            bare: self.bare.clone(),
--            backed: Vec::new(),
--            queue: command_buffer.command_queue().id(),
--        };
-+        let mut rendered = previous.map_or_else(
-+            || Rendered {
-+                layout: self.layout.clone(),
-+                bare: self.bare.clone(),
-+                backed: Vec::new(),
-+                queue: command_buffer.command_queue().id(),
-+            },
-+            |previous| previous.rendered,
-+        );
-         for (at, execution) in self.executions.iter().enumerate() {
-+            if !self.contains_execution(at) {
-+                recorded.push(Vec::new());
-+                continue;
-+            }
-             // Whether the execution's instance has its run passes.
-             let splits = self.instances.iter().any(|instance| {
-                 instance.runs.is_some()
-@@ -2484,7 +2685,7 @@ impl DeferredPass {
-         }
-         // The fragment imageblock storage a command's draw made, cleared before the pass as the
-         // encoder clears its own, held until the command buffer completes, and announced.
--        if let (None, Some(made)) = (&self.storage.imageblock, &storage.imageblock) {
-+        if let (None, Some(made)) = (&initial_storage.imageblock, &storage.imageblock) {
-             made.clear()?.record(&mut core);
-             core.retain(made.held());
-             command_buffer.device().degrade_fragment_imageblock(made);
-@@ -2495,6 +2696,10 @@ impl DeferredPass {
-         // command buffer completes and announced. No such run is an instance's first, which runs
-         // the pass's load actions, nor its last: the shadow is filled by a copy of the stencil.
-         let mut uses = self.uses.clone();
-+        if let Some(planned) = &planned_shadows {
-+            uses.extend(planned.instances.iter().chain(&planned.dispatches)
-+                .flatten().flat_map(crate::shadow::ShadowCopy::uses));
-+        }
-         // The memoryless attachments' backings, attachments of the pass, held until the command
-         // buffer completes.
-         for backing in &rendered.backed {
-@@ -2525,7 +2730,7 @@ impl DeferredPass {
-         let shadow_runs = recorded.iter().flatten().filter(|run| run.shadow).count();
-         let shadow_copies = match (&storage.shadow, &rendered.layout.depth_stencil) {
-             (Some(shadow), Some(ds)) if shadow_runs > 0 => {
--                if self.storage.shadow.is_none() {
-+                if initial_storage.shadow.is_none() {
-                     uses.extend(shadow.copy_uses(&ds.target)?);
-                     core.retain(shadow.held());
-                     let device = command_buffer.device();
-@@ -2562,6 +2767,9 @@ impl DeferredPass {
-             Some(_) | None => None,
-         };
-         for (index, instance) in self.instances.iter().enumerate() {
-+            if !self.instances_range.contains(&index) {
-+                continue;
-+            }
-             // Each run: an execution's past its first (its shape and views where they are
-             // another's, whether its draws test the stencil in the shader, its steps, and the
-             // steps before it), or none for the instance's own, and its secondaries.
-@@ -2676,7 +2884,8 @@ impl DeferredPass {
-                     runs.iter()
-                         .enumerate()
-                         .map(move |(run, (pass, framebuffer, cbs, around))| {
--                            (at, run, run == last, (*framebuffer, *pass), cbs, *around)
-+                            (at + self.instances_range.start, run, run == last,
-+                                (*framebuffer, *pass), cbs, *around)
-                         })
-                 });
-                 for (index, (at, run_index, last_run, (framebuffer, pass), run, around)) in
-@@ -2684,8 +2893,12 @@ impl DeferredPass {
-                 {
+@@ -2685,7 +2687,11 @@ impl DeferredPass {
                      let (shadowed, run_steps, before) = around;
                      // Each instance after the first sees everything the one before wrote.
--                    if index > 0 {
+                     if index > 0 {
 -                        Barrier::everything().record(raw, cb);
-+                    if index > 0 || self.instances_range.start > 0 {
 +                        let barrier = match run_index {
 +                            0 => steps.barrier_before(at),
 +                            _ => Barrier::everything(),
@@ -1031,46 +432,11 @@ index 458c571..41eb130 100644
                      }
                      // Its steps before its first run, and after its last (`render/pass_steps.rs`).
                      if run_index == 0 {
-@@ -2714,7 +2927,9 @@ impl DeferredPass {
-                         steps.after(raw, cb, at);
-                     }
-                 }
--                steps.end(raw, cb);
-+                if self.instances_range.end == self.instances.len() {
-+                    steps.end(raw, cb);
-+                }
-             }
-         });
-         if shapes.len() > self.instances.len() {
-@@ -2738,6 +2953,7 @@ impl DeferredPass {
-         let mut segment = core.end_segment()?;
-         segment.resident_misses = found.misses;
-         segment.faults = found.faults;
-+        *lock(&self.after) = Some(PassProgress { storage, rendered });
-         Ok(segment)
-     }
- 
-@@ -2755,15 +2971,6 @@ impl DeferredPass {
-         let Ok(residency) = command_buffer.residency() else {
-             return made;
-         };
--        // The step refuses such a pass (`record`).
--        if self.shadowed
--            && self
--                .executions
--                .iter()
--                .any(|execution| residency.beyond(&execution.snapshot.residency))
--        {
--            return made;
--        }
-         let Ok(mut core) = EncoderCore::segment(command_buffer, false) else {
-             return made;
-         };
 diff --git a/crates/metal2vulkan-runtime/src/render/pass_steps.rs b/crates/metal2vulkan-runtime/src/render/pass_steps.rs
-index 676efd6..c9cb8c1 100644
+index 676efd6..5e0eb3c 100644
 --- a/crates/metal2vulkan-runtime/src/render/pass_steps.rs
 +++ b/crates/metal2vulkan-runtime/src/render/pass_steps.rs
-@@ -77,10 +77,13 @@ pub(super) struct PassSteps {
+@@ -77,6 +77,7 @@ pub(super) struct PassSteps {
      /// colors over a buffer's bytes rendered through copied stand-ins are merged back and copied
      /// in again (`reloads`), and those the pass does not load are copied back (`published`).
      pub(super) reload_at: std::collections::BTreeSet<usize>,
@@ -1078,13 +444,7 @@ index 676efd6..c9cb8c1 100644
      pub(super) reloads: Vec<std::sync::Arc<crate::linear_merge::LinearMerge>>,
      pub(super) published: Option<StandInCopies>,
      /// The shadowed textures' copies before each instance past the first, in order.
-     pub(super) texel_copies: Vec<Vec<ShadowCopy>>,
-+    /// The copies planned from the command buffer's complete residency at commit.
-+    pub(super) deferred_shadows: Option<std::sync::Arc<super::DeferredShadows>>,
-     pub(super) planes: Option<PlanesCommands>,
-     /// The copies between the stencil and its shader-side shadow.
-     pub(super) shadow_copies: Option<ShadowCopies>,
-@@ -99,6 +102,10 @@ pub(super) struct PassSteps {
+@@ -99,6 +100,10 @@ pub(super) struct PassSteps {
  }
  
  impl PassSteps {
@@ -1095,42 +455,6 @@ index 676efd6..c9cb8c1 100644
      /// Record what goes before instance `index` (the module docs), after the barrier that
      /// orders it after the instance before.
      ///
-@@ -123,7 +130,12 @@ impl PassSteps {
-                     copies.record_in(raw, command_buffer);
-                 }
-             }
--            let texels = index.checked_sub(1).and_then(|i| self.texel_copies.get(i));
-+            let prepared = self.deferred_shadows.as_ref().and_then(|plan| plan.planned());
-+            let texels = if let Some(prepared) = &prepared {
-+                (index > 0).then(|| prepared.instances.get(index)).flatten()
-+            } else {
-+                index.checked_sub(1).and_then(|i| self.texel_copies.get(i))
-+            };
-             for copy in texels.into_iter().flatten() {
-                 copy.record(raw, command_buffer);
-                 Barrier::everything().record(raw, command_buffer);
-@@ -215,14 +227,18 @@ impl PassSteps {
-             if let Some(copies) = self.stand_in_copies.as_ref().filter(|_| tests) {
-                 copies.record_out(raw, command_buffer);
-             }
--            for staged in self
-+            let prepared = self.deferred_shadows.as_ref().and_then(|plan| plan.planned());
-+            for (at, staged) in self
-                 .dispatches
-                 .iter()
--                .filter(|s| s.dispatch.after == index + 1)
-+                .enumerate()
-+                .filter(|(_, s)| s.dispatch.after == index + 1)
-             {
-                 // Its shadowed textures' copies, each after a barrier from what precedes it; the
-                 // dispatch begins with another.
--                for copy in &staged.copies {
-+                let copies = prepared.as_ref().and_then(|plan| plan.dispatches.get(at))
-+                    .unwrap_or(&staged.copies);
-+                for copy in copies {
-                     Barrier::everything().record(raw, command_buffer);
-                     copy.record(raw, command_buffer);
-                 }
 diff --git a/crates/metal2vulkan-runtime/src/resource.rs b/crates/metal2vulkan-runtime/src/resource.rs
 index 40837cf..9d9e79e 100644
 --- a/crates/metal2vulkan-runtime/src/resource.rs
@@ -1183,7 +507,7 @@ index 40837cf..9d9e79e 100644
          }
      }
 diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
-index e040049..200e3e4 100644
+index e040049..b89e864 100644
 --- a/crates/metal2vulkan-runtime/src/texture.rs
 +++ b/crates/metal2vulkan-runtime/src/texture.rs
 @@ -3120,7 +3120,8 @@ impl Device {
@@ -1209,28 +533,6 @@ index e040049..200e3e4 100644
          self.new_image_starting(
              plan,
              layout,
-@@ -4685,6 +4688,9 @@ impl Texture {
-     /// The facts a binding plan reads of the texture.
-     pub(super) fn facts(&self) -> TextureFacts {
-         let mut facts = texture_facts(&self.0.record);
-+        if let Some(format) = self.pvrtc_sample_format() {
-+            facts.pixel_format = format;
-+        }
-         facts.depth_twin = self.twin_image().is_some();
-         facts.sparse = self.is_sparse();
-         // A wrapped image made without `MUTABLE_FORMAT` takes no view in a storage binding's
-@@ -5267,7 +5273,10 @@ impl Texture {
-         // of its own (`texture/view_shadow.rs`); a binding's own view is checked again where it is
-         // made. A texture buffer's view is a texel buffer view of the same bytes, which takes any
-         // format of its class.
--        let apart = match &self.0.storage {
-+        let decoded_pvrtc_view = self.pvrtc_sample_format().is_some()
-+            && super::image_plan::block_family(self.pixel_format())
-+                == super::image_plan::block_family(record.pixel_format);
-+        let apart = !decoded_pvrtc_view && match &self.0.storage {
-             Storage::Texels(_) => false,
-             Storage::Image(image)
-             | Storage::Alias { image, .. }
 diff --git a/crates/metal2vulkan-runtime/src/texture/heap.rs b/crates/metal2vulkan-runtime/src/texture/heap.rs
 index 1210427..8351055 100644
 --- a/crates/metal2vulkan-runtime/src/texture/heap.rs

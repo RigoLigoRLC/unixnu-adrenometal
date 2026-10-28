@@ -1173,7 +1173,6 @@ pub struct NmbRenderPipelineDescriptor {
     pub vertex_inputs: u64,
     pub attributes: [NmbVertexAttribute; 31],
     pub layouts: [NmbVertexLayout; 31],
-    pub extended: NmbExtendedRenderPipelineDescriptor,
 }
 
 fn optional_format(value: u64) -> Result<Option<PixelFormat>, String> {
@@ -1260,8 +1259,7 @@ fn render_descriptor(descriptor: *const NmbRenderPipelineDescriptor) -> Result<R
                 inputs.attributes.insert(i as u32, VertexAttributeDescriptor::new(raw::<VertexFormat>(a.format, "vertex format")?,
                                                                                     a.offset as u32, a.buffer as u32));
                 if let Some(l) = d.layouts.get(a.buffer as usize) {
-                    let stride = (l.stride != u64::MAX).then_some(l.stride as u32);
-                    let mut layout = VertexBufferLayoutDescriptor::new(stride);
+                    let mut layout = VertexBufferLayoutDescriptor::new(Some(l.stride as u32));
                     layout.step_function = raw::<VertexStepFunction>(l.step_function, "step function")?;
                     layout.step_rate = l.step_rate as u32;
                     inputs.layouts.insert(a.buffer as u32, layout);
@@ -1269,7 +1267,6 @@ fn render_descriptor(descriptor: *const NmbRenderPipelineDescriptor) -> Result<R
             }
             out.vertex_descriptor = Some(inputs);
         }
-        apply_extended_render_pipeline(&mut out, &d.extended)?;
         Ok(out)
 }
 
@@ -1714,7 +1711,6 @@ fn resource_references<'a>(resources: *const NmbResourceReference, count: usize)
     resources.iter().map(|resource| match resource.kind {
         0 => Ok(get(resource.handle.cast::<NmbBuffer>())?.0.as_resource()),
         1 => Ok(get(resource.handle.cast::<NmbTexture>())?.0.as_resource()),
-        2 => Ok(get(resource.handle.cast::<NmbIndirectCommandBuffer>())?.0.as_resource()),
         kind => Err(format!("unknown resource kind {kind}")),
     }).collect()
 }
@@ -1808,7 +1804,6 @@ pub struct NmbRenderPassDescriptor {
     pub array_length: u64,
     pub samples: u64,
     pub visibility: *const NmbBuffer,
-    pub extended: NmbExtendedRenderPassDescriptor,
 }
 
 fn texture_of(a: &NmbPassAttachment) -> Result<Option<Texture>, String> {
@@ -1853,7 +1848,6 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, 
         if !d.visibility.is_null() {
             pass.visibility_result_buffer = Some(get(d.visibility)?.0.clone());
         }
-        apply_extended_render_pass(&mut pass, &d.extended)?;
         let encoder = get(command_buffer)?.0.render_command_encoder(&pass).map_err(e("render encoder"))?;
         Ok(boxed(NmbEncoder::Render(encoder)))
     })
@@ -2220,4 +2214,3 @@ pub extern "C" fn nmb_blit_generate_mipmaps(encoder: *mut NmbEncoder, texture: *
     })
 }
 
-include!("NativeMetalExtended.rs");

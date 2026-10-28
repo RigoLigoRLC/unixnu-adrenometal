@@ -5,8 +5,7 @@
 // Every result comes from the runtime and the GPU: a refused call returns nil/NO with the runtime's reason, an encoder call the runtime
 // refuses fails its command buffer (status Error, handlers run) instead of being dropped. A selector this frontend does not implement is
 // reported through the missing-selector hook before the usual exception, so a hardware run names the gap.
-// Shared events currently carry process-local handles. Heaps, argument buffers and indirect commands use retained runtime objects;
-// display presentation is owned by the IOSurface and native display path.
+// Shared events carry process-local handles. Display presentation is owned by the IOSurface and native display path.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurfaceRef.h>
@@ -25,11 +24,6 @@
 #include <mach/mach.h>
 #include "bridge/NativeMetalObjects.h"
 #include "NativeBridgeMetalFrontend.h"
-
-@class NBCommandBuffer;
-static NmbIndirectCommandBuffer *nbExtendedIndirectHandle(id resource);
-static bool nbExtendedRenderPipeline(MTLRenderPipelineDescriptor *descriptor,NmbExtendedRenderPipelineDescriptor *extended,NSError **error);
-static bool nbExtendedRenderPass(MTLRenderPassDescriptor *descriptor,NmbExtendedRenderPassDescriptor *extended,NBCommandBuffer *commandBuffer);
 
 extern "C" void sys_dcache_flush(void *start, size_t length);
 
@@ -106,23 +100,10 @@ static void journal(const std::string &line) {
  if(FILE *f=fopen(gJournalPath.c_str(),"a")){fwrite(line.data(),1,line.size(),f);fputc('\n',f);fclose(f);}
 }
 
-static std::atomic<uint64_t> gObjectTraceSequence{1};
-
-@interface NBObject : NSObject {
- uint64_t _traceObjectID;
-}
+@interface NBObject : NSObject
 @property(atomic,copy) NSString *label;
 @end
 @implementation NBObject
-- (instancetype)init {
- if ((self = [super init])) {
-  _traceObjectID = gObjectTraceSequence.fetch_add(1, std::memory_order_relaxed);
- }
- return self;
-}
-- (uint64_t)globalTraceObjectID {
- return _traceObjectID;
-}
 - (id<MTLDevice>)device {return gDeviceObject;}
 - (void)doesNotRecognizeSelector:(SEL)selector {
  if(gMissing)gMissing(class_getName(object_getClass(self)),sel_getName(selector));
@@ -638,8 +619,6 @@ static void waitForResource(id resource) {
    references.push_back({0,[(NBBuffer *)resource handle]});
   } else if([resource isKindOfClass:[NBTexture class]]) {
    references.push_back({1,[(NBTexture *)resource handle]});
-  } else if(NmbIndirectCommandBuffer *indirect=nbExtendedIndirectHandle(resource)) {
-   references.push_back({2,indirect});
   } else {
    [_commandBuffer refuse:@"missing or foreign resource"];
    return false;
@@ -1001,9 +980,6 @@ static void scheduled(void *context);
   [_resourceOwners addObject:d.visibilityResultBuffer];
   pass.visibility=[(NBBuffer *)d.visibilityResultBuffer handle];
  }
- if(!nbExtendedRenderPass(d,&pass.extended,self)) {
-  return nil;
- }
  return [self encoder:[NBRenderEncoder new] handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
 }
 - (void)addScheduledHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
@@ -1283,7 +1259,7 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
    if(a.bufferIndex<31){MTLVertexBufferLayoutDescriptor *l=v.layouts[a.bufferIndex];p->layouts[a.bufferIndex]={l.stride,(uint64_t)l.stepFunction,l.stepRate};}
   }
  }
- return nbExtendedRenderPipeline(d,&p->extended,error);
+ return true;
 }
 
 // ---- heaps ----
@@ -1399,26 +1375,6 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 @interface NBDeviceMethods : NSObject
 @end
 @implementation NBDeviceMethods
-- (NSUInteger)maxIOCommandsInFlight {
- // The inherited Metal IO queue bounds its file workers with this device limit.
- return 16;
-}
-- (void)getDefaultSamplePositions:(MTLSamplePosition *)positions count:(NSUInteger)count {
- NmbSamplePosition locations[4] = {};
- if (!positions || count > 4) {
-  [NSException raise:NSInvalidArgumentException format:@"invalid default sample-position output or count %lu", (unsigned long)count];
-  return;
- }
-
- if (!nmb_device_default_sample_positions(gDevice, locations, count)) {
-  [NSException raise:NSInvalidArgumentException format:@"default sample positions: %@", lastError()];
-  return;
- }
-
- for (NSUInteger index = 0; index < count; ++index) {
-  positions[index] = MTLSamplePositionMake(locations[index].x, locations[index].y);
- }
-}
 - (NSString *)name {return gName;}
 - (uint64_t)registryID {return gRegistryID;}
 - (NSUInteger)maxBufferLength {return nmb_device_max_buffer_length(gDevice);}
@@ -1662,8 +1618,6 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  NBDepthStencil *state=[NBDepthStencil new];state.handle=handle;return (id<MTLDepthStencilState>)state;
 }
 @end
-
-#include "NativeBridgeMetalExtended.inc"
 
 // The device queries the runtime answers (nmb_device_answer_selector), as methods of the device class. One without an argument is read once
 // and installed only where the device has an answer of its own; one with an argument asks the runtime each call, and a refusal answers 0/NO
