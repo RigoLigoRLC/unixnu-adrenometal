@@ -423,7 +423,7 @@ index 3553b11..347153a 100644
              if let Some(used) = self.residency.use_resource(resource, usage, stages) {
                  self.core.retain(used);
 diff --git a/crates/metal2vulkan-runtime/src/render/executions.rs b/crates/metal2vulkan-runtime/src/render/executions.rs
-index 458c571..7d39154 100644
+index 458c571..41eb130 100644
 --- a/crates/metal2vulkan-runtime/src/render/executions.rs
 +++ b/crates/metal2vulkan-runtime/src/render/executions.rs
 @@ -53,10 +53,9 @@
@@ -722,7 +722,16 @@ index 458c571..7d39154 100644
          RenderCommandEncoder {
              core,
              earlier: Vec::new(),
-@@ -2215,6 +2311,15 @@ impl RenderExecution {
+@@ -2073,6 +2169,8 @@ impl RenderExecution {
+             barrier_inside: false,
+             reaches_unnamed: true,
+             reload_at: std::collections::BTreeSet::new(),
++            next_barrier: None,
++            instance_barriers: BTreeMap::new(),
+             called: true,
+             drew: true,
+             drawn: crate::clear_reach::DrawnArea::unbounded(),
+@@ -2215,6 +2313,15 @@ impl RenderExecution {
  /// A pass that executes render commands, left to record as a segment of its encoder (the module
  /// docs): each instance's begin, the secondaries its subpass runs, and its end.
  pub(crate) struct DeferredPass {
@@ -738,7 +747,7 @@ index 458c571..7d39154 100644
      instances: Vec<PassInstance>,
      /// The steps around its instances, as the encoder's own pass records them
      /// (`render/pass_steps.rs`): the shadowed textures' copies, the sample planes', the
-@@ -2239,14 +2344,26 @@ pub(crate) struct DeferredPass {
+@@ -2239,14 +2346,26 @@ pub(crate) struct DeferredPass {
      /// passes for makes its pass and framebuffer.
      layout: PassLayout,
      bare: Option<PassLayout>,
@@ -769,7 +778,7 @@ index 458c571..7d39154 100644
  /// One render pass instance of a [`DeferredPass`].
  pub(super) struct PassInstance {
      pub(super) pass: vk::RenderPass,
-@@ -2295,22 +2412,88 @@ impl DeferredPass {
+@@ -2295,22 +2414,88 @@ impl DeferredPass {
          (executions, pending): (Vec<RenderExecution>, Vec<PendingDraw>),
          storage: PassStorage,
          (layout, bare): (PassLayout, Option<PassLayout>),
@@ -869,7 +878,7 @@ index 458c571..7d39154 100644
      /// Make, at the commit of `command_buffer` and on its thread, what the host step that
      /// records the pass needs and would otherwise make on the scheduler's thread, which makes
      /// no render pass, framebuffer or image (`creation.rs`): `ahead.rs`. Once; a part it fails
-@@ -2327,9 +2510,16 @@ impl DeferredPass {
+@@ -2327,9 +2512,16 @@ impl DeferredPass {
      /// encoder made its buffer resident for writing (`IndirectCommandBuffer::gpu_written`, for
      /// good), or the range it reads from a buffer.
      pub(crate) fn gpu_written(&self) -> bool {
@@ -887,7 +896,7 @@ index 458c571..7d39154 100644
      }
  
      /// Whether a pipeline one of its draws records is still being made.
-@@ -2404,7 +2594,10 @@ impl DeferredPass {
+@@ -2404,7 +2596,10 @@ impl DeferredPass {
          }
          // The first length each buffer (by its resource ID) was executed with from each command.
          let mut first: BTreeMap<(u64, u32), usize> = BTreeMap::new();
@@ -899,7 +908,7 @@ index 458c571..7d39154 100644
              let (range, _) = execution.range.commands(execution.icb.size())?;
              if range.is_empty() {
                  continue;
-@@ -2430,33 +2623,39 @@ impl DeferredPass {
+@@ -2430,33 +2625,39 @@ impl DeferredPass {
          if step {
              self.degrade_repeated_start(command_buffer.device())?;
          }
@@ -958,7 +967,7 @@ index 458c571..7d39154 100644
              // Whether the execution's instance has its run passes.
              let splits = self.instances.iter().any(|instance| {
                  instance.runs.is_some()
-@@ -2484,7 +2683,7 @@ impl DeferredPass {
+@@ -2484,7 +2685,7 @@ impl DeferredPass {
          }
          // The fragment imageblock storage a command's draw made, cleared before the pass as the
          // encoder clears its own, held until the command buffer completes, and announced.
@@ -967,7 +976,7 @@ index 458c571..7d39154 100644
              made.clear()?.record(&mut core);
              core.retain(made.held());
              command_buffer.device().degrade_fragment_imageblock(made);
-@@ -2495,6 +2694,10 @@ impl DeferredPass {
+@@ -2495,6 +2696,10 @@ impl DeferredPass {
          // command buffer completes and announced. No such run is an instance's first, which runs
          // the pass's load actions, nor its last: the shadow is filled by a copy of the stencil.
          let mut uses = self.uses.clone();
@@ -978,7 +987,7 @@ index 458c571..7d39154 100644
          // The memoryless attachments' backings, attachments of the pass, held until the command
          // buffer completes.
          for backing in &rendered.backed {
-@@ -2525,7 +2728,7 @@ impl DeferredPass {
+@@ -2525,7 +2730,7 @@ impl DeferredPass {
          let shadow_runs = recorded.iter().flatten().filter(|run| run.shadow).count();
          let shadow_copies = match (&storage.shadow, &rendered.layout.depth_stencil) {
              (Some(shadow), Some(ds)) if shadow_runs > 0 => {
@@ -987,7 +996,7 @@ index 458c571..7d39154 100644
                      uses.extend(shadow.copy_uses(&ds.target)?);
                      core.retain(shadow.held());
                      let device = command_buffer.device();
-@@ -2562,6 +2765,9 @@ impl DeferredPass {
+@@ -2562,6 +2767,9 @@ impl DeferredPass {
              Some(_) | None => None,
          };
          for (index, instance) in self.instances.iter().enumerate() {
@@ -997,7 +1006,7 @@ index 458c571..7d39154 100644
              // Each run: an execution's past its first (its shape and views where they are
              // another's, whether its draws test the stencil in the shader, its steps, and the
              // steps before it), or none for the instance's own, and its secondaries.
-@@ -2676,7 +2882,8 @@ impl DeferredPass {
+@@ -2676,7 +2884,8 @@ impl DeferredPass {
                      runs.iter()
                          .enumerate()
                          .map(move |(run, (pass, framebuffer, cbs, around))| {
@@ -1007,7 +1016,7 @@ index 458c571..7d39154 100644
                          })
                  });
                  for (index, (at, run_index, last_run, (framebuffer, pass), run, around)) in
-@@ -2684,8 +2891,12 @@ impl DeferredPass {
+@@ -2684,8 +2893,12 @@ impl DeferredPass {
                  {
                      let (shadowed, run_steps, before) = around;
                      // Each instance after the first sees everything the one before wrote.
@@ -1022,7 +1031,7 @@ index 458c571..7d39154 100644
                      }
                      // Its steps before its first run, and after its last (`render/pass_steps.rs`).
                      if run_index == 0 {
-@@ -2714,7 +2925,9 @@ impl DeferredPass {
+@@ -2714,7 +2927,9 @@ impl DeferredPass {
                          steps.after(raw, cb, at);
                      }
                  }
@@ -1033,7 +1042,7 @@ index 458c571..7d39154 100644
              }
          });
          if shapes.len() > self.instances.len() {
-@@ -2738,6 +2951,7 @@ impl DeferredPass {
+@@ -2738,6 +2953,7 @@ impl DeferredPass {
          let mut segment = core.end_segment()?;
          segment.resident_misses = found.misses;
          segment.faults = found.faults;
@@ -1041,7 +1050,7 @@ index 458c571..7d39154 100644
          Ok(segment)
      }
  
-@@ -2755,15 +2969,6 @@ impl DeferredPass {
+@@ -2755,15 +2971,6 @@ impl DeferredPass {
          let Ok(residency) = command_buffer.residency() else {
              return made;
          };

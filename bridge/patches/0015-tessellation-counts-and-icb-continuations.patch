@@ -351,6 +351,18 @@ index 57a3786..c641b89 100644
      /// Whether the draws use no shadowed texture.
      pub(super) fn is_empty(&self) -> bool {
          self.shadows.is_empty()
+diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
+index 9e37fb9..76ec49f 100644
+--- a/crates/metal2vulkan-runtime/src/shadow.rs
++++ b/crates/metal2vulkan-runtime/src/shadow.rs
+@@ -991,6 +991,7 @@ struct Entry<M> {
+ }
+ 
+ /// A command's use of a shadowed texture: its copies, and whether it writes through it.
++#[derive(Clone)]
+ pub(super) struct ShadowUse {
+     pub(super) copies: Arc<ShadowCopies>,
+     pub(super) writes: bool,
 diff --git a/crates/metal2vulkan/src/bind/graphics.rs b/crates/metal2vulkan/src/bind/graphics.rs
 index a477fab..e5a51f3 100644
 --- a/crates/metal2vulkan/src/bind/graphics.rs
