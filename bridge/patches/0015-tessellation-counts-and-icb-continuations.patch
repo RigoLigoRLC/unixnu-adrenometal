@@ -390,7 +390,7 @@ index a477fab..e5a51f3 100644
          PushConstantWrite {
              stages: vk::ShaderStageFlags::TESSELLATION_CONTROL,
 diff --git a/crates/metal2vulkan/src/cache/codec.rs b/crates/metal2vulkan/src/cache/codec.rs
-index 3ad67db..16b0382 100644
+index 3ad67db..6091d83 100644
 --- a/crates/metal2vulkan/src/cache/codec.rs
 +++ b/crates/metal2vulkan/src/cache/codec.rs
 @@ -797,6 +797,7 @@ codec_enum! {
@@ -417,7 +417,17 @@ index 3ad67db..16b0382 100644
      }
      Symbol { Binding(f0), DescriptorSet(f0), Location(f0), Component(f0), SpecId(f0) }
  }
-@@ -1350,6 +1353,7 @@ codec_enum! {
+@@ -1342,6 +1345,9 @@ codec_enum! {
+         NativeMinMax,
+         NativeDot,
+         NativeMix,
++        DeviceSampleLevel,
++        ExtendedRangeRoundedBlend,
++        ExtendedRangeSampling,
+     }
+     BindingSource {
+         Buffer(f0), Texture(f0), Sampler(f0), CombinedTextureSampler { texture, sampler },
+@@ -1350,6 +1356,7 @@ codec_enum! {
          SeparateTexture { texture, sampler }, SeparateSampler { stage, sampler },
          RawTexture(f0),
          ExtendedShadow(f0),
