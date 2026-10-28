@@ -8,8 +8,8 @@ use metal2vulkan::bind::SamplerDescriptor;
 use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
 use metal2vulkan::library::{FunctionConstantValue, FunctionConstantValues};
 use metal2vulkan::metal::{
-    BlendFactor, BlendOperation, ColorWriteMask, CompareFunction, CullMode, DataType, IndexType, PixelFormat, PrimitiveTopologyClass,
-    PrimitiveType, RenderStages, SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter, SamplerMipFilter, StencilOperation, TextureType,
+    BarrierScope, BlendFactor, BlendOperation, ColorWriteMask, CompareFunction, CullMode, DataType, DispatchType, IndexType, PixelFormat, PrimitiveTopologyClass,
+    PrimitiveType, RenderStages, ResourceUsage, SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter, SamplerMipFilter, StencilOperation, TextureType,
     TextureUsage, TriangleFillMode, VertexFormat, VertexStepFunction, Winding,
 };
 use metal2vulkan::pipeline::{
@@ -19,7 +19,7 @@ use metal2vulkan::pipeline::{
 use metal2vulkan_runtime::{
     BinaryArchive, BinaryArchiveDescriptor, BlitCommandEncoder, FamilyRow, FeatureRow, GpuFamily, RowState, BlitOption, Buffer, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
     ComputePipelineState, Deallocator, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction,
-    MetalLevel, Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
+    MetalLevel, Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions, ResourceRef,
     SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
 };
 use std::cell::RefCell;
@@ -254,6 +254,19 @@ pub extern "C" fn nmb_device_work_stats(device: *const NmbDevice, out: *mut u64)
         out[7] = cache.hits;
         out[8] = cache.misses;
         out[9] = cache.writes;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_synchronization_stats(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null synchronization stats".into());
+        }
+        let counts = get(device)?.0.synchronization_counts();
+        // SAFETY: the header requires sixteen writable words.
+        unsafe { std::slice::from_raw_parts_mut(out, counts.len()) }.copy_from_slice(&counts);
         Ok(true)
     })
 }
@@ -1160,6 +1173,7 @@ pub struct NmbRenderPipelineDescriptor {
     pub vertex_inputs: u64,
     pub attributes: [NmbVertexAttribute; 31],
     pub layouts: [NmbVertexLayout; 31],
+    pub extended: NmbExtendedRenderPipelineDescriptor,
 }
 
 fn optional_format(value: u64) -> Result<Option<PixelFormat>, String> {
@@ -1246,7 +1260,8 @@ fn render_descriptor(descriptor: *const NmbRenderPipelineDescriptor) -> Result<R
                 inputs.attributes.insert(i as u32, VertexAttributeDescriptor::new(raw::<VertexFormat>(a.format, "vertex format")?,
                                                                                     a.offset as u32, a.buffer as u32));
                 if let Some(l) = d.layouts.get(a.buffer as usize) {
-                    let mut layout = VertexBufferLayoutDescriptor::new(Some(l.stride as u32));
+                    let stride = (l.stride != u64::MAX).then_some(l.stride as u32);
+                    let mut layout = VertexBufferLayoutDescriptor::new(stride);
                     layout.step_function = raw::<VertexStepFunction>(l.step_function, "step function")?;
                     layout.step_rate = l.step_rate as u32;
                     inputs.layouts.insert(a.buffer as u32, layout);
@@ -1254,6 +1269,7 @@ fn render_descriptor(descriptor: *const NmbRenderPipelineDescriptor) -> Result<R
             }
             out.vertex_descriptor = Some(inputs);
         }
+        apply_extended_render_pipeline(&mut out, &d.extended)?;
         Ok(out)
 }
 
@@ -1678,10 +1694,91 @@ pub enum NmbEncoder {
     Blit(BlitCommandEncoder),
 }
 
+/// A borrowed frontend resource, with its handle kind checked before an encoder uses the list.
+#[repr(C)]
+pub struct NmbResourceReference {
+    pub kind: u32,
+    pub handle: *const c_void,
+}
+
+fn resource_references<'a>(resources: *const NmbResourceReference, count: usize) -> Result<Vec<ResourceRef<'a>>, String> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if resources.is_null() {
+        return Err("null resource list".into());
+    }
+
+    // SAFETY: the header requires count initialized entries, whose handles live for this call.
+    let resources = unsafe { std::slice::from_raw_parts(resources, count) };
+    resources.iter().map(|resource| match resource.kind {
+        0 => Ok(get(resource.handle.cast::<NmbBuffer>())?.0.as_resource()),
+        1 => Ok(get(resource.handle.cast::<NmbTexture>())?.0.as_resource()),
+        2 => Ok(get(resource.handle.cast::<NmbIndirectCommandBuffer>())?.0.as_resource()),
+        kind => Err(format!("unknown resource kind {kind}")),
+    }).collect()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_encoder_use_resources(encoder: *mut NmbEncoder, resources: *const NmbResourceReference, count: usize, usage: u64, stages: u64) -> bool {
+    guard(false, || {
+        let resources = resource_references(resources, count)?;
+        let usage = raw::<ResourceUsage>(usage, "resource usage")?;
+        match get_mut(encoder)? {
+            NmbEncoder::Compute(c) => c.use_resources(&resources, usage),
+            NmbEncoder::Render(r) => r.use_resources(&resources, usage, raw::<RenderStages>(stages, "render stages")?),
+            NmbEncoder::Blit(_) => return Err("useResources on a blit encoder".into()),
+        }.map_err(e("use resources"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_encoder_barrier_scope(encoder: *mut NmbEncoder, scope: u64, after_stages: u64, before_stages: u64) -> bool {
+    guard(false, || {
+        let scope = raw::<BarrierScope>(scope, "barrier scope")?;
+        match get_mut(encoder)? {
+            NmbEncoder::Compute(c) => c.memory_barrier_with_scope(scope),
+            NmbEncoder::Render(r) => r.memory_barrier_with_scope(scope,
+                raw::<RenderStages>(after_stages, "after render stages")?,
+                raw::<RenderStages>(before_stages, "before render stages")?),
+            NmbEncoder::Blit(_) => return Err("memory barrier on a blit encoder".into()),
+        }
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_encoder_barrier_resources(encoder: *mut NmbEncoder, resources: *const NmbResourceReference, count: usize, after_stages: u64, before_stages: u64) -> bool {
+    guard(false, || {
+        let resources = resource_references(resources, count)?;
+        match get_mut(encoder)? {
+            NmbEncoder::Compute(c) => c.memory_barrier_with_resources(&resources),
+            NmbEncoder::Render(r) => r.memory_barrier_with_resources(&resources,
+                raw::<RenderStages>(after_stages, "after render stages")?,
+                raw::<RenderStages>(before_stages, "before render stages")?),
+            NmbEncoder::Blit(_) => return Err("memory barrier on a blit encoder".into()),
+        }.map_err(e("resource memory barrier"))?;
+        Ok(true)
+    })
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_compute_encoder_new(command_buffer: *mut NmbCommandBuffer) -> *mut NmbEncoder {
+    nmb_compute_encoder_new_with_dispatch_type(command_buffer, 0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_compute_encoder_new_with_dispatch_type(
+    command_buffer: *mut NmbCommandBuffer,
+    dispatch_type: u64,
+) -> *mut NmbEncoder {
     guard(std::ptr::null_mut(), || {
-        Ok(boxed(NmbEncoder::Compute(get(command_buffer)?.0.compute_command_encoder().map_err(e("compute encoder"))?)))
+        let dispatch_type = raw::<DispatchType>(dispatch_type, "compute dispatch type")?;
+        let encoder = get(command_buffer)?.0
+            .compute_command_encoder_with_dispatch_type(dispatch_type)
+            .map_err(e("compute encoder"))?;
+        Ok(boxed(NmbEncoder::Compute(encoder)))
     })
 }
 
@@ -1711,6 +1808,7 @@ pub struct NmbRenderPassDescriptor {
     pub array_length: u64,
     pub samples: u64,
     pub visibility: *const NmbBuffer,
+    pub extended: NmbExtendedRenderPassDescriptor,
 }
 
 fn texture_of(a: &NmbPassAttachment) -> Result<Option<Texture>, String> {
@@ -1755,6 +1853,7 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, 
         if !d.visibility.is_null() {
             pass.visibility_result_buffer = Some(get(d.visibility)?.0.clone());
         }
+        apply_extended_render_pass(&mut pass, &d.extended)?;
         let encoder = get(command_buffer)?.0.render_command_encoder(&pass).map_err(e("render encoder"))?;
         Ok(boxed(NmbEncoder::Render(encoder)))
     })
@@ -2120,3 +2219,5 @@ pub extern "C" fn nmb_blit_generate_mipmaps(encoder: *mut NmbEncoder, texture: *
         Ok(true)
     })
 }
+
+include!("NativeMetalExtended.rs");

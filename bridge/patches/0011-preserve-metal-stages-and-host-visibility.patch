@@ -1,0 +1,1640 @@
+diff --git a/crates/metal2vulkan-runtime/src/buffer.rs b/crates/metal2vulkan-runtime/src/buffer.rs
+index 1dec6a0..dee91e2 100644
+--- a/crates/metal2vulkan-runtime/src/buffer.rs
++++ b/crates/metal2vulkan-runtime/src/buffer.rs
+@@ -1333,7 +1333,9 @@ impl Device {
+             mirror,
+         } = parts;
+         let pages = self.pages_of(raw, memory, offset, base, reach);
+-        let identity = Identity::new(modes.hazard, of_heap);
++        let host_accessible = matches!(modes.storage, StorageMode::Shared | StorageMode::Managed)
++            || !matches!(owner, Owner::Runtime);
++        let identity = Identity::new_with_host_access(modes.hazard, of_heap, host_accessible);
+         let lie = match owner {
+             // A no-copy buffer's pages are its until a rebind (`rebind.rs`).
+             Owner::Caller => {
+@@ -1369,7 +1371,7 @@ impl Device {
+         (address, reserved): (GpuAddress, Held),
+         release: Option<Release>,
+     ) -> Buffer {
+-        let identity = Identity::new(modes.hazard, false);
++        let identity = Identity::new_with_host_access(modes.hazard, false, true);
+         let own = OwnBytes {
+             lie: self.host_lie(identity.key, import, release),
+             reserved,
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+index d90691f..f72ab71 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+@@ -7,7 +7,7 @@
+ //!    `VkCommandBuffer`s (an encoder's segments among its own), each encoder after the barrier the
+ //!    tracker planned for it. The first barrier also makes what completed batches wrote visible
+ //!    ([`Barrier::after_completed`]).
+-//! 2. The end: the barrier that makes every write visible to the host ([`Barrier::to_host`]),
++//! 2. The end: the barrier for writes to allocations with CPU consumers ([`Barrier::to_host_from`]),
+ //!    then the signals: the events' kept signal indices, the caller's binary semaphores and the
+ //!    queue's timeline value. When an event's previous kept signal is pending on another
+ //!    `VkQueue`, this part waits for it, so the event's semaphore is signaled in index order
+@@ -93,7 +93,8 @@ use crate::sparse::bind::{bind_batch, BindFailure, Bound};
+ use crate::sparse::encoder::SparseUpdate;
+ use crate::texture::wrapped::Transition;
+ use crate::texture::Texture;
+-use crate::tracker::{Barrier, EncoderUses, Point, Summary};
++use crate::tracker::{Access, Barrier, EncoderUses, Point, Summary, Use};
++use crate::resource::ResourceKey;
+ use ash::vk;
+ use metal2vulkan::bind::ReplayFaults;
+ use std::sync::Arc;
+@@ -204,7 +205,7 @@ impl CommandBufferShared {
+                 })?;
+                 let first = &mut state.recorded[range.start];
+                 first.raws.push(raw);
+-                first.summary.join(Summary::outside_encoders(uses));
++                first.summary.join(outside_encoder_uses(uses));
+                 if !signalled {
+                     after_all = Some(scheduler.values.clone());
+                 }
+@@ -289,8 +290,14 @@ impl CommandBufferShared {
+                 exit_uses.push(image.transition_use());
+             }
+         }
+-        let entry = (!entries.is_empty()).then(|| Summary::outside_encoders(entry_uses));
+-        let exit = (!exits.is_empty()).then(|| Summary::outside_encoders(exit_uses));
++        let entry = (!entries.is_empty()).then(|| outside_encoder_uses(entry_uses));
++        let exit = (!exits.is_empty()).then(|| outside_encoder_uses(exit_uses));
++        let summaries = entry.iter()
++            .chain(encoders.iter().map(|recorded| &recorded.summary))
++            .chain(&exit);
++        let (accesses, mut host_writes) = summaries.fold((Access::NONE, Access::NONE), |(accesses, host), summary| {
++            (accesses.union(summary.accesses()), host.union(summary.host_writes()))
++        });
+         let plan = scheduler.tracker.plan(
+             entry
+                 .iter()
+@@ -310,7 +317,7 @@ impl CommandBufferShared {
+             exit_barrier = last;
+             barriers = rest;
+         }
+-        let mut lead = Some(Barrier::after_completed());
++        let mut lead = Barrier::after_completed_for(accesses);
+         let mut work = Vec::with_capacity(2 * (end - start) + 1);
+         if entry.is_some() {
+             let globals: Vec<Barrier> = lead.take().into_iter().chain(entry_barrier).collect();
+@@ -343,6 +350,10 @@ impl CommandBufferShared {
+                         .is_some_and(|ended| ended.keys.contains(&key))
+             })
+         });
++        // Initialization and staged host uploads contain internal copies outside encoder uses.
++        if first_work.has_first() || first_work.has_staged() {
++            host_writes = host_writes.union(Barrier::to_host().src);
++        }
+         // The first work goes in a `VkSubmitInfo` of its own just before the batch's, in its
+         // `vkQueueSubmit` (the module docs). Host calls' staged copies go at the batch's start.
+         let lead = match first_work.has_first() {
+@@ -445,17 +456,20 @@ impl CommandBufferShared {
+             order_values.append(&mut wait_values);
+             order_stages.append(&mut wait_stages);
+         }
+-        // The end, where the batch has something to end. A batch with no work, no wait, no image
+-        // to move back and no timestamp records none: none of its commands wrote anything, every
+-        // batch before it on any `VkQueue` made its own writes visible to the host before its
+-        // signals, and its signals follow every command submitted before them. A wait needs it:
+-        // a wait orders the commands of its batch, and a signal follows those, not the wait.
++        // Timeline signal operations make device writes available, including private storage.
++        // CPU consumers additionally need host visibility. A batch of waits alone records an
++        // execution dependency so that its signals follow commands ordered by those waits.
+         let stamps = Stamps {
+             start: start_stamp.take(),
+             end: slot.filter(|_| last),
+         };
+-        let ends = !single
+-            || !order_semaphores.is_empty()
++        let host_barrier = Barrier::to_host_from(host_writes);
++        let wait_barrier = (!order_semaphores.is_empty() && host_barrier.is_none()).then_some(Barrier {
++            src: Access::new(vk::PipelineStageFlags2::ALL_COMMANDS, vk::AccessFlags2::NONE),
++            dst: Access::new(vk::PipelineStageFlags2::ALL_COMMANDS, vk::AccessFlags2::NONE),
++        });
++        let ends = host_barrier.is_some()
++            || wait_barrier.is_some()
+             || exit_barrier.is_some()
+             || !exits.is_empty()
+             || stamps.start.is_some()
+@@ -464,7 +478,8 @@ impl CommandBufferShared {
+             true => {
+                 let finale_barriers: Vec<Barrier> = exit_barrier
+                     .into_iter()
+-                    .chain([Barrier::to_host()])
++                    .chain(host_barrier)
++                    .chain(wait_barrier)
+                     .collect();
+                 let kept = &mut scheduler.kept;
+                 vec![self.barrier_buffer(&mut state, kept, at, &finale_barriers, &exits, stamps)?]
+@@ -570,6 +585,7 @@ impl CommandBufferShared {
+             }
+             return Err(error);
+         }
++        shared.counts.submission_accesses(end - start + usize::from(entry.is_some()) + usize::from(exit.is_some()), accesses, host_writes);
+         if last {
+             state.times.kernel_end = gpu_time::host_nanos();
+         }
+@@ -805,8 +821,15 @@ impl CommandBufferShared {
+     }
+ }
+ 
+-/// The command buffer's failure for a batch's sparse binding that failed: a heap filled inside a
+-/// device unit, the device's memory, or the bind itself.
++/// The external image or sparse mapping operations, with host writes selected by backing storage.
++fn outside_encoder_uses(uses: Vec<Use<ResourceKey>>) -> Summary<ResourceKey> {
++    let host_writes = uses.iter()
++        .filter(|used| used.key.host_accessible())
++        .fold(Access::NONE, |all, used| all.union(used.write));
++    Summary::outside_encoders(uses).with_host_writes(host_writes)
++}
++
++/// The command buffer's failure for a batch's sparse binding that failed.
+ fn bind_error(device: &crate::Device, failure: BindFailure) -> CommandBufferError {
+     match failure {
+         BindFailure::Split => CommandBufferError::SparseHeapSplit,
+diff --git a/crates/metal2vulkan-runtime/src/compute.rs b/crates/metal2vulkan-runtime/src/compute.rs
+index 0863fd5..ead9f9b 100644
+--- a/crates/metal2vulkan-runtime/src/compute.rs
++++ b/crates/metal2vulkan-runtime/src/compute.rs
+@@ -908,6 +908,11 @@ impl ComputeCommandEncoder {
+     /// it adds nothing Metal would not do.
+     pub fn memory_barrier_with_scope(&mut self, scope: BarrierScope) {
+         self.log(|_| ComputeCall::BarrierWithScope(scope));
++        self.core.device().shared().counts.scope_barrier();
++        if self.dispatch_type == DispatchType::Serial {
++            self.core.device().shared().counts.serial_barrier_elided();
++            return;
++        }
+         if !scope.intersects(BarrierScope::BUFFERS.union(BarrierScope::TEXTURES)) {
+             return;
+         }
+@@ -949,6 +954,7 @@ impl ComputeCommandEncoder {
+         for resource in resources {
+             self.core.check_device(call, resource.device())?;
+         }
++        self.core.device().shared().counts.resources_declared(resources.len());
+         for &resource in resources {
+             let used = self
+                 .residency
+diff --git a/crates/metal2vulkan-runtime/src/encoder.rs b/crates/metal2vulkan-runtime/src/encoder.rs
+index 1194f78..cd40161 100644
+--- a/crates/metal2vulkan-runtime/src/encoder.rs
++++ b/crates/metal2vulkan-runtime/src/encoder.rs
+@@ -524,6 +524,7 @@ impl EncoderCore {
+         let tracked = aliased.as_deref().unwrap_or(uses);
+         let barrier = self.uses.barrier(tracked);
+         self.uses.record(stages, tracked, barrier);
++        self.record_host_writes(uses);
+         self.touch_reaching(uses, resident);
+         Some(barrier)
+     }
+@@ -686,6 +687,7 @@ impl EncoderCore {
+         let aliased = self.aliased(uses);
+         self.uses
+             .record(stages, aliased.as_deref().unwrap_or(uses), None);
++        self.record_host_writes(uses);
+         self.touch_reaching(uses, resident);
+         Ok(())
+     }
+@@ -723,6 +725,15 @@ impl EncoderCore {
+             .after(shadows, aliased.as_deref().unwrap_or(uses));
+     }
+ 
++    /// The completed shadow plan returns its final copies without recording them. A deferred
++    /// render pass records these after its attachment stores and resolves.
++    pub(super) fn finish_shadow_plan(&mut self) -> Vec<ShadowCopy> {
++        let copies = self.shadows.finish();
++        let texels = copies.iter().map(ShadowCopy::texels_back).sum();
++        self.device().shared().counts.shadow_copies_planned(copies.len(), texels);
++        copies
++    }
++
+     /// Record shadowed textures' `copies` as commands of the encoder: ordered as any command
+     /// is, in an encoder Metal orders; with a barrier from everything before and one to
+     /// everything after each copy, in one whose commands Metal leaves unordered.
+@@ -749,6 +760,7 @@ impl EncoderCore {
+                 let aliased = self.aliased(&uses);
+                 self.uses
+                     .record(stages, aliased.as_deref().unwrap_or(&uses), None);
++                self.record_host_writes(&uses);
+                 self.touch(&uses);
+             }
+         }
+@@ -760,6 +772,22 @@ impl EncoderCore {
+         self.replaying
+     }
+ 
++    /// The current command contributes only its writes to allocations with a CPU consumer.
++    fn record_host_writes(&mut self, uses: &[Use<ResourceKey>]) {
++        let mut writes = super::tracker::Access::NONE;
++        let (mut host, mut private) = (0, 0);
++        for used in uses.iter().filter(|used| !used.write.is_empty()) {
++            if used.key.host_accessible() {
++                writes = writes.union(used.write);
++                host += 1;
++            } else {
++                private += 1;
++            }
++        }
++        self.uses.record_host_writes(writes);
++        self.device().shared().counts.host_write_uses(host, private);
++    }
++
+     /// The encoder's uses, for its fence waits and updates.
+     pub(super) fn uses(&mut self) -> &mut EncoderUses<ResourceKey> {
+         &mut self.uses
+diff --git a/crates/metal2vulkan-runtime/src/fence.rs b/crates/metal2vulkan-runtime/src/fence.rs
+index 57c8a10..dd73800 100644
+--- a/crates/metal2vulkan-runtime/src/fence.rs
++++ b/crates/metal2vulkan-runtime/src/fence.rs
+@@ -8,10 +8,9 @@
+ //!   an identity the tracker keys on.
+ //! - **Resource barriers** order dispatches of one compute encoder: one global memory barrier,
+ //!   as for a scope barrier.
+-//! - **A render encoder's** fences are the same encoder-level orderings: a wait orders all of
+-//!   the encoder's work after the update, and an update follows all of it, which covers any
+-//!   stages the calls name (Metal's fences are evaluated at the pass's start and end; "Drivers
+-//!   may delay fence updates until the end of the encoder"). Its memory barriers order the draws
++//! - **A render encoder's** fences retain the named render stages until submission. A wait and
++//!   update also cover the transfer and compute commands implementing those stages. Metal's
++//!   fences are evaluated at the pass's start and end. Its memory barriers order the draws
+ //!   after them behind those before. Vulkan's barriers inside a render pass instance are limited
+ //!   to its subpass's dependency on itself, which is by region over the framebuffer-space
+ //!   stages: it orders the fragment stages' accesses of one pixel. A barrier over the render
+@@ -41,8 +40,9 @@ use super::render::RenderCall;
+ use super::render::RenderCommandEncoder;
+ use super::replay::{BlitCall, ComputeCall, Resource};
+ use super::resource::{ResourceKey, ResourceRef};
+-use super::tracker::Barrier;
+-use metal2vulkan::metal::{BarrierScope, RenderStages};
++use super::tracker::{Access, Barrier};
++use ash::vk;
++use metal2vulkan::metal::{BarrierScope, DispatchType, RenderStages};
+ use std::sync::{Arc, Mutex};
+ 
+ /// A Metal fence (`MTLFence`). Cheap to clone (a retain); `Send + Sync`. Two handles are equal
+@@ -116,6 +116,7 @@ impl EncoderCore {
+     fn update_fence(&mut self, call: &'static str, fence: &Fence) -> Result<(), Error> {
+         self.check_device(call, fence.device())?;
+         self.uses().update_fence(fence.0.key);
++        self.device().shared().counts.fence_updated();
+         Ok(())
+     }
+ 
+@@ -125,6 +126,7 @@ impl EncoderCore {
+     fn wait_for_fence(&mut self, call: &'static str, fence: &Fence) -> Result<(), Error> {
+         self.check_device(call, fence.device())?;
+         self.uses().wait_for_fence(fence.0.key);
++        self.device().shared().counts.fence_waited();
+         Ok(())
+     }
+ }
+@@ -145,8 +147,13 @@ impl ComputeCommandEncoder {
+         for resource in resources {
+             core.check_device(CALL, resource.device())?;
+         }
++        core.device().shared().counts.resource_barrier();
++        if self.dispatch_type() == DispatchType::Serial {
++            self.core().device().shared().counts.serial_barrier_elided();
++            return Ok(());
++        }
+         if !resources.is_empty() {
+-            core.barrier(Barrier::between_dispatches());
++            self.core().barrier(Barrier::between_dispatches());
+             self.capture(|| Event::Barrier);
+         }
+         Ok(())
+@@ -182,27 +189,35 @@ impl BlitCommandEncoder {
+ }
+ 
+ impl RenderCommandEncoder {
+-    /// `updateFence:afterStages:`: the fence is updated after the encoder's draws. The update
+-    /// follows every stage of the encoder's work, which covers `after_stages` (the module docs).
++    /// `updateFence:afterStages:`: the fence is updated after the named stages and their copies
++    /// or compute emulation, at the end of the encoder.
+     pub fn update_fence(&mut self, fence: &Fence, after_stages: RenderStages) -> Result<(), Error> {
+         self.log(|_| RenderCall::UpdateFence(fence.clone(), after_stages));
+-        // Every stage is ordered, a superset of the ones named.
+-        let _ = after_stages;
+-        self.core().update_fence("update_fence", fence)
++        let core = self.core();
++        core.check_device("update_fence", fence.device())?;
++        if !after_stages.is_empty() {
++            core.uses().update_fence_at(fence.key(), render_stages(after_stages));
++            core.device().shared().counts.fence_updated();
++        }
++        Ok(())
+     }
+ 
+     /// `waitForFence:beforeStages:`: the encoder's draws wait for the fence's last update before
+     /// the encoder in the queue's commit order, also after the encoder updated the fence, as the
+-    /// compute encoder's do; every stage of the encoder waits, which covers `before_stages`.
++    /// compute encoder's do. Only the named stages and their copies or compute emulation wait.
+     pub fn wait_for_fence(
+         &mut self,
+         fence: &Fence,
+         before_stages: RenderStages,
+     ) -> Result<(), Error> {
+         self.log(|_| RenderCall::WaitForFence(fence.clone(), before_stages));
+-        // Every stage waits, a superset of the ones named.
+-        let _ = before_stages;
+-        self.core().wait_for_fence("wait_for_fence", fence)
++        let core = self.core();
++        core.check_device("wait_for_fence", fence.device())?;
++        if !before_stages.is_empty() {
++            core.uses().wait_for_fence_at(fence.key(), render_stages(before_stages));
++            core.device().shared().counts.fence_waited();
++        }
++        Ok(())
+     }
+ 
+     /// `memoryBarrierWithScope:afterStages:beforeStages:`: the writes of the encoder's draws
+@@ -220,6 +235,7 @@ impl RenderCommandEncoder {
+         before_stages: RenderStages,
+     ) {
+         self.log(|_| RenderCall::BarrierWithScope(scope, after_stages, before_stages));
++        self.core().device().shared().counts.scope_barrier();
+         if scope.is_empty() || after_stages.is_empty() || before_stages.is_empty() {
+             return;
+         }
+@@ -230,7 +246,7 @@ impl RenderCommandEncoder {
+             }
+             return;
+         }
+-        self.barrier_before_next_draw();
++        self.barrier_before_next_draw_with(render_barrier(after_stages, before_stages));
+     }
+ 
+     /// `memoryBarrierWithResources:count:afterStages:beforeStages:`: as
+@@ -251,9 +267,39 @@ impl RenderCommandEncoder {
+         for resource in resources {
+             self.core().check_device(CALL, resource.device())?;
+         }
++        self.core().device().shared().counts.resource_barrier();
+         if !resources.is_empty() && !after_stages.is_empty() && !before_stages.is_empty() {
+-            self.barrier_before_next_draw();
++            self.barrier_before_next_draw_with(render_barrier(after_stages, before_stages));
+         }
+         Ok(())
+     }
+ }
++
++/// The Vulkan stages that execute Metal render stages, including generated copies and dispatches.
++fn render_stages(stages: RenderStages) -> vk::PipelineStageFlags2 {
++    let mut result = vk::PipelineStageFlags2::ALL_TRANSFER | vk::PipelineStageFlags2::COMPUTE_SHADER;
++    if stages.contains(RenderStages::VERTEX) {
++        result |= vk::PipelineStageFlags2::DRAW_INDIRECT
++            | vk::PipelineStageFlags2::VERTEX_INPUT
++            | vk::PipelineStageFlags2::VERTEX_SHADER;
++    }
++    if stages.intersects(RenderStages::FRAGMENT.union(RenderStages::TILE)) {
++        result |= vk::PipelineStageFlags2::FRAGMENT_SHADER | super::render_target::ATTACHMENT_STAGES;
++    }
++    if stages.contains(RenderStages::OBJECT) {
++        result |= vk::PipelineStageFlags2::DRAW_INDIRECT;
++    }
++    if stages.contains(RenderStages::MESH) {
++        result |= vk::PipelineStageFlags2::DRAW_INDIRECT | vk::PipelineStageFlags2::VERTEX_SHADER;
++    }
++    result
++}
++
++fn render_barrier(after: RenderStages, before: RenderStages) -> Barrier {
++    // A split stores the attachments and loads them in the next instance as well.
++    let attachments = super::render_target::ATTACHMENT_STAGES;
++    Barrier {
++        src: Access::new(render_stages(after) | attachments, vk::AccessFlags2::MEMORY_WRITE),
++        dst: Access::new(render_stages(before) | attachments, vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE),
++    }
++}
+diff --git a/crates/metal2vulkan-runtime/src/render/arguments.rs b/crates/metal2vulkan-runtime/src/render/arguments.rs
+index 3553b11..347153a 100644
+--- a/crates/metal2vulkan-runtime/src/render/arguments.rs
++++ b/crates/metal2vulkan-runtime/src/render/arguments.rs
+@@ -72,6 +72,7 @@ impl RenderCommandEncoder {
+         for resource in resources {
+             self.core.check_device(call, resource.device())?;
+         }
++        self.core.device().shared().counts.resources_declared(resources.len());
+         for &resource in resources {
+             if let Some(used) = self.residency.use_resource(resource, usage, stages) {
+                 self.core.retain(used);
+diff --git a/crates/metal2vulkan-runtime/src/render/executions.rs b/crates/metal2vulkan-runtime/src/render/executions.rs
+index 458c571..7d39154 100644
+--- a/crates/metal2vulkan-runtime/src/render/executions.rs
++++ b/crates/metal2vulkan-runtime/src/render/executions.rs
+@@ -53,10 +53,9 @@
+ //!   whose addresses resolve against the resources the command buffer's encoders made resident,
+ //!   every encoder's, before the call or after it (`residency.rs`), then against the device's live
+ //!   buffers Metal reaches unnamed (`live_buffers.rs`), as a compute command's do; its functions
+-//!   reach those resources too. Where the pass has a shadowed texture, an execution its command
+-//!   buffer made more resident than its encoder had at the call is refused
+-//!   (`NotImplemented(IndirectRenderCommands)`): the copies around the pass's instances follow what
+-//!   the call gathered (`render/shadows.rs`). An address in none of them (a no-copy buffer or a
++//!   reach those resources too. Shadow copies are planned at commit from that same complete
++//!   residency, before the attachment preparation, between instances, and after the final
++//!   attachment stores (`render/deferred_shadows.rs`). An address in none of them (a no-copy buffer or a
+ //!   heap's buffer no command buffer's commands used yet) misses (the slot unbound, reading zero,
+ //!   counted in the execution report), and an unset buffer reads zero, as Metal's did. A command
+ //!   with no draw, no pipeline state, no vertices, indices, patches or instances runs nothing, and
+@@ -162,9 +161,10 @@
+ //!   pass renders it into a backing from its first instance on, as the encoder's own instances keep
+ //!   it in a stand-in from a split on: an image of the pass held until the command buffer
+ //!   completes, announced as the encoder's (`memoryless-backed`), each instance that runs as
+-//!   several taking a framebuffer of it. Where the pass reads such an attachment past its instances
+-//!   (its sample planes, a color resolve drawn after the pass, a depth/stencil resolve), the commit
+-//!   is refused `NotImplemented(IndirectRenderCommands)`.
++//!   several taking a framebuffer of it. A resolving memoryless color receives its backing
++//!   before the first draw binds input attachments or color-format views. Sample-plane and
++//!   depth/stencil sources receive theirs before the encoder plans copies and resolves. Every
++//!   deferred execution's captured layout refers to those same backing images.
+ //! - **A fetched attachment's stand-in or sample planes** (EVs RFL-inst-m3 and -m4). A run whose
+ //!   draws read and write attachments in the pixel interlock elsewhere than the pass's instances
+ //!   render them has its steps around it (`RunSteps`), as the encoder's instances of such draws do
+@@ -270,6 +270,7 @@ use crate::buffer::Buffer;
+ use crate::command_buffer::CommandBuffer;
+ use crate::degradation::{Degradation, SplitCauses};
+ use crate::device::lock;
++use crate::deferred::Deferred;
+ use crate::encoder::{EncoderCore, RecordedSegment};
+ use crate::error::{internal, invalid, vulkan, Error, Problem, RuntimeGap};
+ use crate::executed_commands::{ExecutedCommand, RecordsRead};
+@@ -303,8 +304,8 @@ use metal2vulkan::metal::{
+ use metal2vulkan::pipeline::VertexStride;
+ use std::borrow::Cow;
+ use std::collections::{BTreeMap, BTreeSet};
+-use std::ops::Range;
+-use std::sync::{Arc, OnceLock};
++use std::ops::{Deref, Range};
++use std::sync::{Arc, Mutex, OnceLock};
+ 
+ mod ahead;
+ 
+@@ -375,7 +376,7 @@ impl RenderCommandEncoder {
+             Inherited::Encoder(state) => Some(state),
+         };
+         self.degrade_repeated_start(icb, &range);
+-        self.defer_execution(icb, ExecutionRange::Fixed(range), pipeline)
++        self.defer_execution(icb, ExecutionRange::Fixed(range), pipeline, None)
+     }
+ 
+     /// `executeCommandsInBuffer:indirectBuffer:indirectBufferOffset:`: run the render commands
+@@ -397,10 +398,9 @@ impl RenderCommandEncoder {
+     /// range buffer of another device, and a range Metal's reading of is not defined (`Invalid`,
+     /// `IndirectCommandBufferProblem::RangeBuffer`): an offset that is not a multiple of 4 bytes,
+     /// at which Metal's GPU faulted, or 8 bytes that run past `range_buffer`, which Metal reads
+-    /// from whatever follows it. A range a draw of the encoder
+-    /// before the call may write is `NotImplemented(IndirectRenderCommands)`: Metal's execution
+-    /// reads that draw's write, where the runtime's copy, made before the pass, would not; as for
+-    /// the index bounds pass, an untracked buffer's writes are not seen. Under an inherited state
++    /// from whatever follows it. A range an earlier draw may write is copied after that draw's
++    /// render pass instance. The following submission reads the completed copy and records the
++    /// execution with the same attachments and visibility offset. Under an inherited state
+     /// made without `supportIndirectCommandBuffers`, whatever the range, `{0, 0}` included, the
+     /// encoder faults as `execute_commands_in_buffer`'s does (EVs CFR-probe1-m4,
+     /// IRX-xfault1-m4 `indirect_empty_nosupport`, `indirect_one_nosupport`).
+@@ -428,16 +428,22 @@ impl RenderCommandEncoder {
+             range_buffer,
+             offset..offset + indirect_execute::RANGE_BYTES,
+         )];
+-        if self.core.uses().written(&read) {
+-            return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands));
+-        }
+-        let copy = indirect_dispatch::copy_arguments(
+-            &mut self.core,
+-            range_buffer,
+-            offset,
+-            indirect_execute::RANGE_BYTES,
+-        )?;
+-        self.defer_execution(icb, ExecutionRange::Indirect(copy), pipeline)
++        let (copy, source) = if self.core.uses().written(&read) || !self.executions.is_empty() {
++            let copy = self.core.device().own_buffer(
++                32,
++                crate::values::ResourceOptions::shared(),
++            )?;
++            (copy, Some((range_buffer.clone(), offset)))
++        } else {
++            let copy = indirect_dispatch::copy_arguments(
++                &mut self.core,
++                range_buffer,
++                offset,
++                indirect_execute::RANGE_BYTES,
++            )?;
++            (copy, None)
++        };
++        self.defer_execution(icb, ExecutionRange::Indirect(copy), pipeline, source)
+     }
+ 
+     /// The pipeline state an execution of `icb` here runs with (`Inherited`). Where the
+@@ -491,6 +497,7 @@ impl RenderCommandEncoder {
+         icb: &IndirectCommandBuffer,
+         range: ExecutionRange,
+         pipeline: Option<RenderPipelineState>,
++        range_source: Option<(Buffer, u64)>,
+     ) -> Result<(), Error> {
+         self.sync_heaps();
+         // An execution rewrites an extended-range or padded attachment as a draw does, of reset
+@@ -528,6 +535,9 @@ impl RenderCommandEncoder {
+         // gives none, and a command's draw that needs them is refused as before
+         // (`hidden_depth_stencil`); an execution of no such draw runs.
+         let hidden = self.needed_hidden().ok().flatten();
++        if range_source.is_some() || (icb.gpu_written() && self.current.recorded) {
++            self.barrier = true;
++        }
+         // The commands draw into an instance of no fetched attachments, shader-side stencil or
+         // views: the current one where it is such an instance and no tile dispatch or memory
+         // barrier follows it, else a new one, as a draw of such a pipeline records.
+@@ -663,6 +673,7 @@ impl RenderCommandEncoder {
+             snapshot,
+             shadows,
+             lent,
++            range_source,
+         });
+         // Its commands may name any pipeline state, reading handles in any stage.
+         self.command_encoded(every_render_stage());
+@@ -703,6 +714,8 @@ pub(crate) struct RenderExecution {
+     icb: IndirectCommandBuffer,
+     /// The commands it runs: a range inside the buffer's size, or one read from a buffer.
+     range: ExecutionRange,
++    /// The original execution range when a previous instance must finish before its copy.
++    range_source: Option<(Buffer, u64)>,
+     /// The encoder's pipeline state where the buffer inherits it.
+     pipeline: Option<RenderPipelineState>,
+     /// The encoder as the call found it.
+@@ -829,6 +842,7 @@ fn framed_layout<'a>(own: &'a PassLayout, framed: &[(usize, Target)]) -> Cow<'a,
+ /// depth and stencil (`bare`): as the encoder ended it, and from the first execution whose
+ /// commands ran as several on, with the backings of its memoryless attachments in their place
+ /// (`backed`).
++#[derive(Clone)]
+ struct Rendered {
+     layout: PassLayout,
+     bare: Option<PassLayout>,
+@@ -847,6 +861,96 @@ struct Backing {
+     own: Target,
+ }
+ 
++/// Input-attachment descriptors and color-format views retain their image when a draw is
++/// encoded. Resolving memoryless colors receive the queue's backing before the first draw so
++/// those descriptors remain valid if an ICB later splits the pass or a shader resolves it.
++pub(super) fn prepare_memoryless_color_reads(
++    maker: &CommandBuffer,
++    layout: &mut PassLayout,
++) -> Result<(), Error> {
++    for color in layout.colors.iter_mut().flatten() {
++        if color.resolve.is_some() || color.copied_resolve.is_some() || color.late_store {
++            let _ = prepare_memoryless_backing(maker, &mut color.target, &mut color.stand_in)?;
++        }
++    }
++    Ok(())
++}
++
++/// Memoryless attachments read by sample-plane copies or resolves use one backing across all
++/// render instances and deferred executions. The encoder fixes these images after settling store
++/// actions and before planning descriptors, copies and framebuffers.
++pub(super) fn back_memoryless_attachments(
++    maker: &CommandBuffer,
++    layout: &mut PassLayout,
++    executions: &mut [RenderExecution],
++) -> Result<(), Error> {
++    if executions.is_empty() {
++        return Ok(());
++    }
++    let mut backed = Vec::new();
++    for (index, color) in layout.colors.iter_mut().enumerate() {
++        let Some(color) = color else {
++            continue;
++        };
++        if color.planes.is_none() && color.resolve.is_none() && color.copied_resolve.is_none() {
++            continue;
++        }
++        if let Some(own) = prepare_memoryless_backing(maker, &mut color.target, &mut color.stand_in)? {
++            backed.push(Backing {
++                index: Some(index),
++                target: color.target.clone(),
++                own,
++            });
++        }
++    }
++    if let Some(ds) = layout.depth_stencil.as_mut().filter(|ds| ds.resolve.is_some()) {
++        if let Some(own) = prepare_memoryless_backing(maker, &mut ds.target, &mut ds.stand_in)? {
++            backed.push(Backing {
++                index: None,
++                target: ds.target.clone(),
++                own,
++            });
++        }
++    }
++    for execution in executions {
++        back(&mut execution.snapshot.layout, &backed)?;
++    }
++    Ok(())
++}
++
++/// The attachment's backing receives sample-plane and resolve reads after its render instances.
++/// An existing stand-in remains the attachment's source; an unbacked memoryless image receives
++/// the texture's retained backing for this queue and subresource.
++fn prepare_memoryless_backing(
++    maker: &CommandBuffer,
++    target: &mut Target,
++    stand_in: &mut Option<StandIn>,
++) -> Result<Option<Target>, Error> {
++    match stand_in {
++        Some(held) if held.cause == Cause::Backing && super::memoryless(&held.own) => {
++            return Ok(Some(held.own.clone()));
++        }
++        Some(_) => return Ok(None),
++        None => {}
++    }
++    if !super::memoryless(target) {
++        return Ok(None);
++    }
++    let own = target.clone();
++    *target = attachment_stand_in::kept_backing(
++        maker,
++        &own,
++        maker.command_queue().id(),
++        false,
++    )?;
++    *stand_in = Some(StandIn {
++        own: own.clone(),
++        cause: Cause::Backing,
++        area: None,
++    });
++    Ok(Some(own))
++}
++
+ impl Rendered {
+     /// `layout`, an execution's at its call, with the pass's backings in place of the memoryless
+     /// attachments they back.
+@@ -865,16 +969,14 @@ impl Rendered {
+     /// into a backing from its first instance on, its own load and store actions kept, as the
+     /// encoder's own instances keep a memoryless attachment in a stand-in from a split on
+     /// (`render.rs`); and so it renders one the commands' draws rendered into a stand-in (a
+-    /// split of theirs, or a fetch), into that stand-in. Refused
+-    /// (`NotImplemented(IndirectRenderCommands)`) where the pass reads such an attachment past
+-    /// its instances: a color one's sample planes (`planes`) or its resolve drawn after the
+-    /// pass (`color_resolve.rs`), and a depth/stencil one's resolve.
++    /// split of theirs, or a fetch), into that stand-in. Attachments consumed by sample-plane
++    /// copies or resolves already have their backing before descriptors and framebuffers are
++    /// planned (`back_memoryless_attachments`).
+     fn back_memoryless(
+         &mut self,
+         maker: &CommandBuffer,
+         run: &mut PassLayout,
+     ) -> Result<(), Error> {
+-        let refused = || Error::NotImplemented(RuntimeGap::IndirectRenderCommands);
+         let mut backed = Vec::new();
+         for (index, color) in self.layout.colors.iter().enumerate() {
+             let Some(color) = color.as_ref().filter(|color| color.stand_in.is_none()) else {
+@@ -885,10 +987,6 @@ impl Rendered {
+             let Some(backing) = backing(maker, Some(index), &color.target, ran, self.queue)? else {
+                 continue;
+             };
+-            let drawn_after = color.resolve.as_ref().is_some_and(|r| r.shader.is_some());
+-            if color.planes.is_some() || drawn_after {
+-                return Err(refused());
+-            }
+             backed.push(backing);
+         }
+         if let Some(ds) = self.layout.depth_stencil.as_ref() {
+@@ -896,9 +994,6 @@ impl Rendered {
+             let ran = ran.map(|ran| (&ran.target, ran.stand_in.as_ref()));
+             if ds.stand_in.is_none() {
+                 if let Some(backing) = backing(maker, None, &ds.target, ran, self.queue)? {
+-                    if ds.resolve.is_some() {
+-                        return Err(refused());
+-                    }
+                     backed.push(backing);
+                 }
+             }
+@@ -1991,9 +2086,10 @@ impl RenderExecution {
+         forms: BufferForms,
+     ) -> RenderCommandEncoder {
+         let snapshot = &self.snapshot;
+-        // The draws use only the shadowed textures the call gathered.
++        // Committed residency includes resources declared after this execution was encoded.
+         let mut shadows = InstanceShadows::default();
+         shadows.add(&self.shadows, &[]);
++        shadows.add_residency(residency);
+         RenderCommandEncoder {
+             core,
+             earlier: Vec::new(),
+@@ -2215,6 +2311,15 @@ impl RenderExecution {
+ /// A pass that executes render commands, left to record as a segment of its encoder (the module
+ /// docs): each instance's begin, the secondaries its subpass runs, and its end.
+ pub(crate) struct DeferredPass {
++    data: Arc<PassData>,
++    instances_range: Range<usize>,
++    before: Option<Arc<Mutex<Option<PassProgress>>>>,
++    after: Arc<Mutex<Option<PassProgress>>>,
++}
++
++/// PassData owns every secondary, attachment operation and execution captured by one render
++/// encoder. DeferredPass submits consecutive instance ranges while retaining this shared data.
++pub(crate) struct PassData {
+     instances: Vec<PassInstance>,
+     /// The steps around its instances, as the encoder's own pass records them
+     /// (`render/pass_steps.rs`): the shadowed textures' copies, the sample planes', the
+@@ -2239,14 +2344,26 @@ pub(crate) struct DeferredPass {
+     /// passes for makes its pass and framebuffer.
+     layout: PassLayout,
+     bare: Option<PassLayout>,
+-    /// A shadowed texture is an attachment of the pass, or one its draws or tile dispatches use
+-    /// (`render/shadows.rs`): the copies around its instances follow the bytes each execution's
+-    /// call gathered.
+-    shadowed: bool,
+     /// What the commit made ahead for the host step that records it (`ahead.rs`), once made.
+     ahead: OnceLock<Arc<Ahead>>,
+ }
+ 
++impl Deref for DeferredPass {
++    type Target = PassData;
++
++    fn deref(&self) -> &PassData {
++        &self.data
++    }
++}
++
++/// PassProgress retains storage and memoryless attachment backings created by an earlier
++/// submission. The next submission loads the same images after its range copy completes.
++#[derive(Clone)]
++struct PassProgress {
++    storage: PassStorage,
++    rendered: Rendered,
++}
++
+ /// One render pass instance of a [`DeferredPass`].
+ pub(super) struct PassInstance {
+     pub(super) pass: vk::RenderPass,
+@@ -2295,22 +2412,88 @@ impl DeferredPass {
+         (executions, pending): (Vec<RenderExecution>, Vec<PendingDraw>),
+         storage: PassStorage,
+         (layout, bare): (PassLayout, Option<PassLayout>),
+-        shadowed: bool,
+     ) -> DeferredPass {
++        let count = instances.len();
+         DeferredPass {
+-            instances,
+-            steps,
+-            uses,
+-            executions,
+-            pending,
+-            storage,
+-            layout,
+-            bare,
+-            shadowed,
+-            ahead: OnceLock::new(),
++            data: Arc::new(PassData {
++                instances,
++                steps,
++                uses,
++                executions,
++                pending,
++                storage,
++                layout,
++                bare,
++                ahead: OnceLock::new(),
++            }),
++            instances_range: 0..count,
++            before: None,
++            after: Arc::new(Mutex::new(None)),
+         }
+     }
+ 
++    /// Submit each group of instances before copying an execution range they may write.
++    /// The following deferred group waits for that copy before reading its range on the CPU.
++    pub(super) fn defer_parts(self: &Arc<Self>, core: &mut EncoderCore) -> Result<(), Error> {
++        let mut start = 0;
++        let mut before = None;
++        for (index, instance) in self.instances.iter().enumerate() {
++            let executions: Vec<_> = instance.pieces.iter().filter_map(|piece| {
++                let Piece::Execution(at) = *piece else {
++                    return None;
++                };
++                let execution = &self.executions[at];
++                (execution.range_source.is_some() || execution.icb.gpu_written())
++                    .then_some(execution)
++            }).collect();
++            if executions.is_empty() {
++                continue;
++            }
++            if index > start {
++                let part = self.part(start..index, before);
++                before = Some(Arc::clone(&part.after));
++                core.defer(Deferred::RenderPass(Arc::new(part)))?;
++            }
++            for execution in executions {
++                if let (Some((source, offset)), ExecutionRange::Indirect(copy)) =
++                    (&execution.range_source, &execution.range)
++                {
++                    indirect_dispatch::copy_arguments_into(
++                        core,
++                        source,
++                        *offset,
++                        indirect_execute::RANGE_BYTES,
++                        copy,
++                    );
++                }
++            }
++            start = index;
++        }
++        let part = self.part(start..self.instances.len(), before);
++        core.defer(Deferred::RenderPass(Arc::new(part)))
++    }
++
++    fn part(
++        &self,
++        instances_range: Range<usize>,
++        before: Option<Arc<Mutex<Option<PassProgress>>>>,
++    ) -> DeferredPass {
++        DeferredPass {
++            data: Arc::clone(&self.data),
++            instances_range,
++            before,
++            after: Arc::new(Mutex::new(None)),
++        }
++    }
++
++    fn contains_execution(&self, execution: usize) -> bool {
++        self.instances[self.instances_range.clone()].iter().any(|instance| {
++            instance.pieces.iter().any(|piece| {
++                matches!(*piece, Piece::Execution(at) if at == execution)
++            })
++        })
++    }
++
+     /// Make, at the commit of `command_buffer` and on its thread, what the host step that
+     /// records the pass needs and would otherwise make on the scheduler's thread, which makes
+     /// no render pass, framebuffer or image (`creation.rs`): `ahead.rs`. Once; a part it fails
+@@ -2327,9 +2510,16 @@ impl DeferredPass {
+     /// encoder made its buffer resident for writing (`IndirectCommandBuffer::gpu_written`, for
+     /// good), or the range it reads from a buffer.
+     pub(crate) fn gpu_written(&self) -> bool {
++        if self.before.is_some() {
++            return true;
++        }
+         self.executions
+             .iter()
+-            .any(|execution| execution.icb.gpu_written() || execution.range.indirect())
++            .enumerate()
++            .any(|(at, execution)| {
++                self.contains_execution(at)
++                    && (execution.icb.gpu_written() || execution.range.indirect())
++            })
+     }
+ 
+     /// Whether a pipeline one of its draws records is still being made.
+@@ -2404,7 +2594,10 @@ impl DeferredPass {
+         }
+         // The first length each buffer (by its resource ID) was executed with from each command.
+         let mut first: BTreeMap<(u64, u32), usize> = BTreeMap::new();
+-        for execution in &self.executions {
++        for (at, execution) in self.executions.iter().enumerate() {
++            if !self.contains_execution(at) {
++                continue;
++            }
+             let (range, _) = execution.range.commands(execution.icb.size())?;
+             if range.is_empty() {
+                 continue;
+@@ -2430,33 +2623,39 @@ impl DeferredPass {
+         if step {
+             self.degrade_repeated_start(command_buffer.device())?;
+         }
+-        // The executions resolve and bind against the command buffer's resident resources,
+-        // every encoder's (`residency.rs`). Where the pass has a shadowed texture, the copies
+-        // around its instances were planned over the bytes each call gathered, from its
+-        // encoder's resources then: one made resident beyond them is refused.
++        // The executions and their shadow copies use the same committed residency.
+         let residency = command_buffer.residency()?;
+-        if self.shadowed
+-            && self
+-                .executions
+-                .iter()
+-                .any(|execution| residency.beyond(&execution.snapshot.residency))
+-        {
+-            return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands));
+-        }
++        let planned_shadows = self.steps.deferred_shadows.as_ref()
++            .map(|plan| plan.ready()).transpose()?;
+         let mut core = EncoderCore::segment(command_buffer, false)?;
+         let mut found = Found::default();
+         let mut recorded = Vec::with_capacity(self.executions.len());
+-        let mut storage = self.storage.clone();
++        let previous = self.before.as_ref().and_then(|previous| lock(previous).clone());
++        if self.before.is_some() && previous.is_none() {
++            return Err(internal("a render continuation before its preceding submission"));
++        }
++        let mut storage = previous.as_ref().map_or_else(
++            || self.storage.clone(),
++            |previous| previous.storage.clone(),
++        );
++        let initial_storage = storage.clone();
+         let mut stood = Vec::new();
+         // The pass's layout as its instances render it: its memoryless attachments backed from
+         // the first execution whose commands run as several on.
+-        let mut rendered = Rendered {
+-            layout: self.layout.clone(),
+-            bare: self.bare.clone(),
+-            backed: Vec::new(),
+-            queue: command_buffer.command_queue().id(),
+-        };
++        let mut rendered = previous.map_or_else(
++            || Rendered {
++                layout: self.layout.clone(),
++                bare: self.bare.clone(),
++                backed: Vec::new(),
++                queue: command_buffer.command_queue().id(),
++            },
++            |previous| previous.rendered,
++        );
+         for (at, execution) in self.executions.iter().enumerate() {
++            if !self.contains_execution(at) {
++                recorded.push(Vec::new());
++                continue;
++            }
+             // Whether the execution's instance has its run passes.
+             let splits = self.instances.iter().any(|instance| {
+                 instance.runs.is_some()
+@@ -2484,7 +2683,7 @@ impl DeferredPass {
+         }
+         // The fragment imageblock storage a command's draw made, cleared before the pass as the
+         // encoder clears its own, held until the command buffer completes, and announced.
+-        if let (None, Some(made)) = (&self.storage.imageblock, &storage.imageblock) {
++        if let (None, Some(made)) = (&initial_storage.imageblock, &storage.imageblock) {
+             made.clear()?.record(&mut core);
+             core.retain(made.held());
+             command_buffer.device().degrade_fragment_imageblock(made);
+@@ -2495,6 +2694,10 @@ impl DeferredPass {
+         // command buffer completes and announced. No such run is an instance's first, which runs
+         // the pass's load actions, nor its last: the shadow is filled by a copy of the stencil.
+         let mut uses = self.uses.clone();
++        if let Some(planned) = &planned_shadows {
++            uses.extend(planned.instances.iter().chain(&planned.dispatches)
++                .flatten().flat_map(crate::shadow::ShadowCopy::uses));
++        }
+         // The memoryless attachments' backings, attachments of the pass, held until the command
+         // buffer completes.
+         for backing in &rendered.backed {
+@@ -2525,7 +2728,7 @@ impl DeferredPass {
+         let shadow_runs = recorded.iter().flatten().filter(|run| run.shadow).count();
+         let shadow_copies = match (&storage.shadow, &rendered.layout.depth_stencil) {
+             (Some(shadow), Some(ds)) if shadow_runs > 0 => {
+-                if self.storage.shadow.is_none() {
++                if initial_storage.shadow.is_none() {
+                     uses.extend(shadow.copy_uses(&ds.target)?);
+                     core.retain(shadow.held());
+                     let device = command_buffer.device();
+@@ -2562,6 +2765,9 @@ impl DeferredPass {
+             Some(_) | None => None,
+         };
+         for (index, instance) in self.instances.iter().enumerate() {
++            if !self.instances_range.contains(&index) {
++                continue;
++            }
+             // Each run: an execution's past its first (its shape and views where they are
+             // another's, whether its draws test the stencil in the shader, its steps, and the
+             // steps before it), or none for the instance's own, and its secondaries.
+@@ -2676,7 +2882,8 @@ impl DeferredPass {
+                     runs.iter()
+                         .enumerate()
+                         .map(move |(run, (pass, framebuffer, cbs, around))| {
+-                            (at, run, run == last, (*framebuffer, *pass), cbs, *around)
++                            (at + self.instances_range.start, run, run == last,
++                                (*framebuffer, *pass), cbs, *around)
+                         })
+                 });
+                 for (index, (at, run_index, last_run, (framebuffer, pass), run, around)) in
+@@ -2684,8 +2891,12 @@ impl DeferredPass {
+                 {
+                     let (shadowed, run_steps, before) = around;
+                     // Each instance after the first sees everything the one before wrote.
+-                    if index > 0 {
+-                        Barrier::everything().record(raw, cb);
++                    if index > 0 || self.instances_range.start > 0 {
++                        let barrier = match run_index {
++                            0 => steps.barrier_before(at),
++                            _ => Barrier::everything(),
++                        };
++                        barrier.record(raw, cb);
+                     }
+                     // Its steps before its first run, and after its last (`render/pass_steps.rs`).
+                     if run_index == 0 {
+@@ -2714,7 +2925,9 @@ impl DeferredPass {
+                         steps.after(raw, cb, at);
+                     }
+                 }
+-                steps.end(raw, cb);
++                if self.instances_range.end == self.instances.len() {
++                    steps.end(raw, cb);
++                }
+             }
+         });
+         if shapes.len() > self.instances.len() {
+@@ -2738,6 +2951,7 @@ impl DeferredPass {
+         let mut segment = core.end_segment()?;
+         segment.resident_misses = found.misses;
+         segment.faults = found.faults;
++        *lock(&self.after) = Some(PassProgress { storage, rendered });
+         Ok(segment)
+     }
+ 
+@@ -2755,15 +2969,6 @@ impl DeferredPass {
+         let Ok(residency) = command_buffer.residency() else {
+             return made;
+         };
+-        // The step refuses such a pass (`record`).
+-        if self.shadowed
+-            && self
+-                .executions
+-                .iter()
+-                .any(|execution| residency.beyond(&execution.snapshot.residency))
+-        {
+-            return made;
+-        }
+         let Ok(mut core) = EncoderCore::segment(command_buffer, false) else {
+             return made;
+         };
+diff --git a/crates/metal2vulkan-runtime/src/render/pass_steps.rs b/crates/metal2vulkan-runtime/src/render/pass_steps.rs
+index 676efd6..c9cb8c1 100644
+--- a/crates/metal2vulkan-runtime/src/render/pass_steps.rs
++++ b/crates/metal2vulkan-runtime/src/render/pass_steps.rs
+@@ -77,10 +77,13 @@ pub(super) struct PassSteps {
+     /// colors over a buffer's bytes rendered through copied stand-ins are merged back and copied
+     /// in again (`reloads`), and those the pass does not load are copied back (`published`).
+     pub(super) reload_at: std::collections::BTreeSet<usize>,
++    pub(super) barriers: std::collections::BTreeMap<usize, Barrier>,
+     pub(super) reloads: Vec<std::sync::Arc<crate::linear_merge::LinearMerge>>,
+     pub(super) published: Option<StandInCopies>,
+     /// The shadowed textures' copies before each instance past the first, in order.
+     pub(super) texel_copies: Vec<Vec<ShadowCopy>>,
++    /// The copies planned from the command buffer's complete residency at commit.
++    pub(super) deferred_shadows: Option<std::sync::Arc<super::DeferredShadows>>,
+     pub(super) planes: Option<PlanesCommands>,
+     /// The copies between the stencil and its shader-side shadow.
+     pub(super) shadow_copies: Option<ShadowCopies>,
+@@ -99,6 +102,10 @@ pub(super) struct PassSteps {
+ }
+ 
+ impl PassSteps {
++    pub(super) fn barrier_before(&self, instance: usize) -> Barrier {
++        self.barriers.get(&instance).copied().unwrap_or_else(Barrier::everything)
++    }
++
+     /// Record what goes before instance `index` (the module docs), after the barrier that
+     /// orders it after the instance before.
+     ///
+@@ -123,7 +130,12 @@ impl PassSteps {
+                     copies.record_in(raw, command_buffer);
+                 }
+             }
+-            let texels = index.checked_sub(1).and_then(|i| self.texel_copies.get(i));
++            let prepared = self.deferred_shadows.as_ref().and_then(|plan| plan.planned());
++            let texels = if let Some(prepared) = &prepared {
++                (index > 0).then(|| prepared.instances.get(index)).flatten()
++            } else {
++                index.checked_sub(1).and_then(|i| self.texel_copies.get(i))
++            };
+             for copy in texels.into_iter().flatten() {
+                 copy.record(raw, command_buffer);
+                 Barrier::everything().record(raw, command_buffer);
+@@ -215,14 +227,18 @@ impl PassSteps {
+             if let Some(copies) = self.stand_in_copies.as_ref().filter(|_| tests) {
+                 copies.record_out(raw, command_buffer);
+             }
+-            for staged in self
++            let prepared = self.deferred_shadows.as_ref().and_then(|plan| plan.planned());
++            for (at, staged) in self
+                 .dispatches
+                 .iter()
+-                .filter(|s| s.dispatch.after == index + 1)
++                .enumerate()
++                .filter(|(_, s)| s.dispatch.after == index + 1)
+             {
+                 // Its shadowed textures' copies, each after a barrier from what precedes it; the
+                 // dispatch begins with another.
+-                for copy in &staged.copies {
++                let copies = prepared.as_ref().and_then(|plan| plan.dispatches.get(at))
++                    .unwrap_or(&staged.copies);
++                for copy in copies {
+                     Barrier::everything().record(raw, command_buffer);
+                     copy.record(raw, command_buffer);
+                 }
+diff --git a/crates/metal2vulkan-runtime/src/resource.rs b/crates/metal2vulkan-runtime/src/resource.rs
+index 40837cf..9d9e79e 100644
+--- a/crates/metal2vulkan-runtime/src/resource.rs
++++ b/crates/metal2vulkan-runtime/src/resource.rs
+@@ -6,15 +6,24 @@ use super::values::{HazardTrackingMode, StorageMode};
+ use super::{Buffer, Device, IndirectCommandBuffer, Texture};
+ use std::sync::atomic::{AtomicU64, Ordering};
+ 
+-/// A resource's key: unique in the process, never reused.
++/// A resource's key: unique in the process, never reused. Bit 0 records whether its backing
++/// has a CPU consumer; aliases copy the whole key with that allocation property.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+ pub(super) struct ResourceKey(u64);
+ 
+ impl ResourceKey {
+     /// A key no resource had before.
+     pub(super) fn new() -> ResourceKey {
+-        static NEXT: AtomicU64 = AtomicU64::new(1);
+-        ResourceKey(NEXT.fetch_add(1, Ordering::Relaxed))
++        Self::new_with_host_access(false)
++    }
++
++    pub(super) fn new_with_host_access(host_accessible: bool) -> ResourceKey {
++        static NEXT: AtomicU64 = AtomicU64::new(2);
++        ResourceKey(NEXT.fetch_add(2, Ordering::Relaxed) | u64::from(host_accessible))
++    }
++
++    pub(super) fn host_accessible(self) -> bool {
++        self.0 & 1 != 0
+     }
+ }
+ 
+@@ -54,13 +63,17 @@ impl Identity {
+     /// A new resource's identity for its hazard tracking `mode`: `Default` is tracked for a
+     /// resource made outside a heap and untracked for one made in a heap, as in Metal.
+     pub(super) fn new(mode: HazardTrackingMode, in_heap: bool) -> Identity {
++        Self::new_with_host_access(mode, in_heap, false)
++    }
++
++    pub(super) fn new_with_host_access(mode: HazardTrackingMode, in_heap: bool, host_accessible: bool) -> Identity {
+         let tracked = match mode {
+             HazardTrackingMode::Tracked => true,
+             HazardTrackingMode::Untracked => false,
+             HazardTrackingMode::Default => !in_heap,
+         };
+         Identity {
+-            key: ResourceKey::new(),
++            key: ResourceKey::new_with_host_access(host_accessible),
+             tracked,
+         }
+     }
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index e040049..200e3e4 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -3120,7 +3120,8 @@ impl Device {
+         descriptor: &TextureDescriptor,
+         hazard: HazardTrackingMode,
+     ) -> Result<Image, Error> {
+-        let identity = Identity::new(hazard, false);
++        let host_accessible = matches!(descriptor.resource_options.storage_mode()?, StorageMode::Shared | StorageMode::Managed);
++        let identity = Identity::new_with_host_access(hazard, false, host_accessible);
+         self.new_image_owned(plan, layout, descriptor, identity, Device::runtime_owner)
+     }
+ 
+@@ -3139,8 +3140,10 @@ impl Device {
+         descriptor: &TextureDescriptor,
+         hazard: HazardTrackingMode,
+     ) -> Result<Image, Error> {
+-        let identity = Identity::new(hazard, false);
+-        let held = descriptor.resource_options.storage_mode()? == StorageMode::Memoryless;
++        let storage = descriptor.resource_options.storage_mode()?;
++        let host_accessible = matches!(storage, StorageMode::Shared | StorageMode::Managed);
++        let identity = Identity::new_with_host_access(hazard, false, host_accessible);
++        let held = storage == StorageMode::Memoryless;
+         self.new_image_starting(
+             plan,
+             layout,
+@@ -4685,6 +4688,9 @@ impl Texture {
+     /// The facts a binding plan reads of the texture.
+     pub(super) fn facts(&self) -> TextureFacts {
+         let mut facts = texture_facts(&self.0.record);
++        if let Some(format) = self.pvrtc_sample_format() {
++            facts.pixel_format = format;
++        }
+         facts.depth_twin = self.twin_image().is_some();
+         facts.sparse = self.is_sparse();
+         // A wrapped image made without `MUTABLE_FORMAT` takes no view in a storage binding's
+@@ -5267,7 +5273,10 @@ impl Texture {
+         // of its own (`texture/view_shadow.rs`); a binding's own view is checked again where it is
+         // made. A texture buffer's view is a texel buffer view of the same bytes, which takes any
+         // format of its class.
+-        let apart = match &self.0.storage {
++        let decoded_pvrtc_view = self.pvrtc_sample_format().is_some()
++            && super::image_plan::block_family(self.pixel_format())
++                == super::image_plan::block_family(record.pixel_format);
++        let apart = !decoded_pvrtc_view && match &self.0.storage {
+             Storage::Texels(_) => false,
+             Storage::Image(image)
+             | Storage::Alias { image, .. }
+diff --git a/crates/metal2vulkan-runtime/src/texture/heap.rs b/crates/metal2vulkan-runtime/src/texture/heap.rs
+index 1210427..8351055 100644
+--- a/crates/metal2vulkan-runtime/src/texture/heap.rs
++++ b/crates/metal2vulkan-runtime/src/texture/heap.rs
+@@ -2369,7 +2369,7 @@ impl Device {
+             // `rebind.rs`, `detach.rs`); elsewhere a key of its own, as it shares no memory.
+             let key = match binding.host {
+                 true => bytes.identity().key,
+-                false => ResourceKey::new(),
++                false => ResourceKey::new_with_host_access(matches!(options.storage_mode()?, StorageMode::Shared | StorageMode::Managed)),
+             };
+             let identity = Identity {
+                 key,
+diff --git a/crates/metal2vulkan-runtime/src/texture/wrapped.rs b/crates/metal2vulkan-runtime/src/texture/wrapped.rs
+index fcd1c46..631ba78 100644
+--- a/crates/metal2vulkan-runtime/src/texture/wrapped.rs
++++ b/crates/metal2vulkan-runtime/src/texture/wrapped.rs
+@@ -583,7 +583,7 @@ impl Device {
+         let plan = wrap_plan(plan, info, families, self.shared().sharing()).map_err(wrapped)?;
+         let aspects = image_aspects(plan.format);
+         check_layouts(layouts, info.usage.into(), aspects).map_err(wrapped)?;
+-        let identity = Identity::new(hazard, false);
++        let identity = Identity::new_with_host_access(hazard, false, true);
+         if layouts.moves() && !identity.tracked {
+             return Err(wrapped(WrappedImageProblem::Untracked));
+         }
+diff --git a/crates/metal2vulkan-runtime/src/tracker.rs b/crates/metal2vulkan-runtime/src/tracker.rs
+index 0b532a0..948e74c 100644
+--- a/crates/metal2vulkan-runtime/src/tracker.rs
++++ b/crates/metal2vulkan-runtime/src/tracker.rs
+@@ -312,6 +312,11 @@ impl Barrier {
+         }
+     }
+ 
++    /// Visibility of completed submissions' writes for the accesses this batch records.
++    pub(super) fn after_completed_for(dst: Access) -> Option<Barrier> {
++        (!dst.is_empty()).then_some(Barrier { src: Access::NONE, dst })
++    }
++
+     /// The end of every batch: every earlier write before the host's reads and writes, so the CPU
+     /// sees the GPU's writes once the batch completes, and before the batch's signals.
+     pub(super) fn to_host() -> Barrier {
+@@ -327,6 +332,14 @@ impl Barrier {
+         }
+     }
+ 
++    /// Host visibility for writes to shared storage, imported pages, or CPU readback storage.
++    pub(super) fn to_host_from(src: Access) -> Option<Barrier> {
++        (!src.is_empty()).then_some(Barrier {
++            src,
++            dst: Access::new(vk::PipelineStageFlags2::HOST, vk::AccessFlags2::HOST_READ | vk::AccessFlags2::HOST_WRITE),
++        })
++    }
++
+     /// Everything recorded before, before everything recorded after: a shadowed texture's copy
+     /// in an encoder whose commands Metal does not order (`shadow.rs`).
+     pub(super) fn everything() -> Barrier {
+@@ -949,9 +962,45 @@ pub(super) struct EncoderUses<K> {
+     /// The parts, in order: the last is the current one. Never empty.
+     parts: Vec<Part<K>>,
+     /// The fences waited for: before the encoder's first part.
+-    waits: Vec<K>,
++    waits: Vec<FenceScope<K>>,
+     /// The fences updated: after its last part.
+-    updates: Vec<K>,
++    updates: Vec<FenceScope<K>>,
++}
++
++/// A fence call's resource key and the Vulkan stages selected by its Metal API.
++#[derive(Clone, Copy)]
++struct FenceScope<K> {
++    key: K,
++    /// Empty selects every stage recorded by the encoder (compute and blit calls).
++    stages: vk::PipelineStageFlags2,
++}
++
++impl<K: Copy + Eq> FenceScope<K> {
++    fn insert(scopes: &mut Vec<Self>, key: K, stages: vk::PipelineStageFlags2) {
++        if let Some(scope) = scopes.iter_mut().find(|scope| scope.key == key) {
++            scope.stages = if scope.stages.is_empty() || stages.is_empty() {
++                vk::PipelineStageFlags2::NONE
++            } else {
++                scope.stages | stages
++            };
++        } else {
++            scopes.push(FenceScope { key, stages });
++        }
++    }
++
++    fn resolve(&self, actual: vk::PipelineStageFlags2) -> vk::PipelineStageFlags2 {
++        if self.stages.is_empty() {
++            return actual;
++        }
++        // Copies and compute emulation implement render stages outside the graphics pipeline.
++        let helpers = vk::PipelineStageFlags2::ALL_TRANSFER | vk::PipelineStageFlags2::COPY
++            | vk::PipelineStageFlags2::BLIT | vk::PipelineStageFlags2::RESOLVE
++            | vk::PipelineStageFlags2::CLEAR | vk::PipelineStageFlags2::COMPUTE_SHADER;
++        if actual.contains(vk::PipelineStageFlags2::ALL_COMMANDS) {
++            return self.stages;
++        }
++        (self.stages & !helpers) | (actual & helpers)
++    }
+ }
+ 
+ /// The uses of one part of an encoder.
+@@ -959,6 +1008,8 @@ struct Part<K> {
+     /// The tracked uses so far, one per range, at most [`ENTRIES_PER_KEY`] per resource.
+     tracked: HashMap<K, Vec<Use<K>>>,
+     stages: vk::PipelineStageFlags2,
++    accesses: Access,
++    host_writes: Access,
+ }
+ 
+ impl<K> Part<K> {
+@@ -966,6 +1017,8 @@ impl<K> Part<K> {
+         Part {
+             tracked: HashMap::new(),
+             stages: vk::PipelineStageFlags2::NONE,
++            accesses: Access::NONE,
++            host_writes: Access::NONE,
+         }
+     }
+ }
+@@ -1007,10 +1060,13 @@ impl<K: Copy + Ord + Hash> EncoderUses<K> {
+         barrier: Option<Barrier>,
+     ) {
+         let part = self.current();
+-        // Every stage, untracked work's too: a fence wait orders all of the encoder's work.
++        // Untracked work contributes stages too, so explicit fences cover its commands.
+         part.stages |= uses.iter().fold(stages, |all, used| {
+             all | used.read.stages | used.write.stages
+         });
++        for used in uses {
++            part.accesses = part.accesses.union(used.read).union(used.write);
++        }
+         if self.ordered {
+             admit(
+                 &mut self.inside,
+@@ -1039,6 +1095,12 @@ impl<K: Copy + Ord + Hash> EncoderUses<K> {
+         }
+     }
+ 
++    /// The current command's writes to storage whose allocation permits a host consumer.
++    pub(super) fn record_host_writes(&mut self, writes: Access) {
++        let part = self.current();
++        part.host_writes = part.host_writes.union(writes);
++    }
++
+     /// Whether a command the encoder recorded so far writes memory one of `uses` reads: an
+     /// overlapping range of a tracked resource. A command recorded before the encoder's earlier
+     /// commands run (a render encoder's index bounds pass, recorded before its pass) would read
+@@ -1101,16 +1163,20 @@ impl<K: Copy + Ord + Hash> EncoderUses<K> {
+     /// Metal's compute, blit and render encoders do (an M4 read the earlier encoder's write in
+     /// three runs of each); Metal's API validation asserts.
+     pub(super) fn wait_for_fence(&mut self, fence: K) {
+-        if !self.waits.contains(&fence) {
+-            self.waits.push(fence);
+-        }
++        self.wait_for_fence_at(fence, vk::PipelineStageFlags2::NONE);
++    }
++
++    pub(super) fn wait_for_fence_at(&mut self, fence: K, stages: vk::PipelineStageFlags2) {
++        FenceScope::insert(&mut self.waits, fence, stages);
+     }
+ 
+     /// `update_fence`: the fence is updated after the encoder's work.
+     pub(super) fn update_fence(&mut self, fence: K) {
+-        if !self.updates.contains(&fence) {
+-            self.updates.push(fence);
+-        }
++        self.update_fence_at(fence, vk::PipelineStageFlags2::NONE);
++    }
++
++    pub(super) fn update_fence_at(&mut self, fence: K, stages: vk::PipelineStageFlags2) {
++        FenceScope::insert(&mut self.updates, fence, stages);
+     }
+ 
+     /// The part commands are recorded into now.
+@@ -1154,6 +1220,8 @@ impl<K: Copy + Ord + Hash> EncoderUses<K> {
+                 Summary {
+                     uses,
+                     stages: part.stages,
++                    accesses: part.accesses,
++                    host_writes: part.host_writes,
+                     waits: Vec::new(),
+                     updates: Vec::new(),
+                 }
+@@ -1293,10 +1361,14 @@ pub(super) struct Summary<K> {
+     uses: Vec<Use<K>>,
+     /// Every stage the encoder's commands ran in.
+     stages: vk::PipelineStageFlags2,
++    /// All tracked and untracked accesses, accumulated while commands are encoded.
++    accesses: Access,
++    /// Writes to storage with a host consumer, accumulated at those same calls.
++    host_writes: Access,
+     /// The fences waited for before the encoder.
+-    waits: Vec<K>,
++    waits: Vec<FenceScope<K>>,
+     /// The fences updated after the encoder.
+-    updates: Vec<K>,
++    updates: Vec<FenceScope<K>>,
+ }
+ 
+ impl<K> fmt::Debug for Summary<K> {
+@@ -1315,9 +1387,13 @@ impl<K: Copy + Ord> Summary<K> {
+     /// a batch's layout transitions of the caller's images, planned among its encoders.
+     pub(super) fn outside_encoders(mut uses: Vec<Use<K>>) -> Summary<K> {
+         uses.sort_by_key(|used| used.key);
++        let accesses = uses.iter().fold(Access::NONE, |all, used| all.union(used.read).union(used.write));
++        let host_writes = uses.iter().fold(Access::NONE, |all, used| all.union(used.write));
+         Summary {
+             uses,
+             stages: vk::PipelineStageFlags2::ALL_COMMANDS,
++            accesses,
++            host_writes,
+             waits: Vec::new(),
+             updates: Vec::new(),
+         }
+@@ -1330,15 +1406,24 @@ impl<K: Copy + Ord> Summary<K> {
+         Summary {
+             uses: Vec::new(),
+             stages: vk::PipelineStageFlags2::ALL_COMMANDS,
+-            waits,
+-            updates,
++            accesses: Access::NONE,
++            host_writes: Access::NONE,
++            waits: waits.into_iter().map(|key| FenceScope { key, stages: vk::PipelineStageFlags2::NONE }).collect(),
++            updates: updates.into_iter().map(|key| FenceScope { key, stages: vk::PipelineStageFlags2::NONE }).collect(),
+         }
+     }
+ 
+     /// The summary of an encoder whose commands do not run (`CommandBuffer::commit_failed`): its
+     /// fences' waits and updates alone, as [`of_fences`](Self::of_fences) makes them.
+     pub(super) fn fences_only(&self) -> Summary<K> {
+-        Summary::of_fences(self.waits.clone(), self.updates.clone())
++        Summary {
++            uses: Vec::new(),
++            stages: self.stages,
++            accesses: Access::NONE,
++            host_writes: Access::NONE,
++            waits: self.waits.clone(),
++            updates: self.updates.clone(),
++        }
+     }
+ 
+     /// The resources of the tracked uses, in order, each once per range.
+@@ -1352,6 +1437,8 @@ impl<K: Copy + Ord> Summary<K> {
+     /// range into one of the same kind, which claims more and stays exact.
+     pub(super) fn join(&mut self, other: Summary<K>) {
+         self.stages |= other.stages;
++        self.accesses = self.accesses.union(other.accesses);
++        self.host_writes = self.host_writes.union(other.host_writes);
+         for used in other.uses {
+             if let Some(known) = self
+                 .uses
+@@ -1388,19 +1475,28 @@ impl<K: Copy + Ord> Summary<K> {
+         }
+         self.uses.sort_by_key(|used| used.key);
+         for fence in other.waits {
+-            if !self.waits.contains(&fence) {
+-                self.waits.push(fence);
+-            }
++            FenceScope::insert(&mut self.waits, fence.key, fence.stages);
+         }
+         for fence in other.updates {
+-            if !self.updates.contains(&fence) {
+-                self.updates.push(fence);
+-            }
++            FenceScope::insert(&mut self.updates, fence.key, fence.stages);
+         }
+     }
+ }
+ 
+ impl<K> Summary<K> {
++    pub(super) fn accesses(&self) -> Access {
++        self.accesses
++    }
++
++    pub(super) fn host_writes(&self) -> Access {
++        self.host_writes
++    }
++
++    pub(super) fn with_host_writes(mut self, writes: Access) -> Self {
++        self.host_writes = writes;
++        self
++    }
++
+     /// The tracked uses.
+     #[cfg(test)]
+     pub(super) fn uses(&self) -> &[Use<K>] {
+@@ -1436,8 +1532,8 @@ impl<K: Copy + Ord> Footprint<K> {
+         };
+         for summary in summaries {
+             footprint.uses.extend(summary.uses.iter().cloned());
+-            footprint.waits.extend(&summary.waits);
+-            footprint.updates.extend(&summary.updates);
++            footprint.waits.extend(summary.waits.iter().map(|fence| fence.key));
++            footprint.updates.extend(summary.updates.iter().map(|fence| fence.key));
+         }
+         footprint.uses.sort_by_key(|used| used.key);
+         footprint
+@@ -1781,14 +1877,15 @@ impl<K: Copy + Ord + Hash> Tracker<K> {
+             let mut barrier = Barrier::default();
+             let mut waited = vk::PipelineStageFlags2::NONE;
+             for fence in &summary.waits {
+-                let update = plan.fences.get(fence).or_else(|| self.fences.get(fence));
++                let update = plan.fences.get(&fence.key).or_else(|| self.fences.get(&fence.key));
+                 if let Some(update) = update {
+                     waited |= update.stages;
++                    let stages = fence.resolve(summary.stages);
+                     if update.at.queue == at.queue {
+                         barrier.add(
+                             Access::new(update.stages, vk::AccessFlags2::MEMORY_WRITE),
+                             Access::new(
+-                                summary.stages,
++                                stages,
+                                 vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+                             ),
+                         );
+@@ -1797,7 +1894,7 @@ impl<K: Copy + Ord + Hash> Tracker<K> {
+                             &mut plan.waits,
+                             Wait {
+                                 at: update.at,
+-                                stages: summary.stages,
++                                stages,
+                             },
+                         );
+                     }
+@@ -1827,9 +1924,9 @@ impl<K: Copy + Ord + Hash> Tracker<K> {
+                 true => plan.uses.extend(summary.uses.iter().cloned()),
+                 false => admit(&mut plan.resources, &summary.uses, barrier, &plan.waits, at),
+             }
+-            for &fence in &summary.updates {
+-                let stages = summary.stages | waited;
+-                plan.fences.insert(fence, FenceUpdate { stages, at });
++            for fence in &summary.updates {
++                let stages = fence.resolve(summary.stages) | waited;
++                plan.fences.insert(fence.key, FenceUpdate { stages, at });
+             }
+             plan.barriers.push(barrier);
+         }
+diff --git a/crates/metal2vulkan-runtime/src/work_counts.rs b/crates/metal2vulkan-runtime/src/work_counts.rs
+index 7fda01b..bd24e98 100644
+--- a/crates/metal2vulkan-runtime/src/work_counts.rs
++++ b/crates/metal2vulkan-runtime/src/work_counts.rs
+@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
+ /// A device's counters (`DeviceShared::counts`), each only ever added to.
+ #[derive(Default)]
+ pub(crate) struct Counters {
++    synchronization: [AtomicU64; 16],
+     command_pools_made: AtomicU64,
+     live_tables_uploaded: AtomicU64,
+     timeline_waits: AtomicU64,
+@@ -127,6 +128,46 @@ pub(crate) enum PoolCompiled {
+ }
+ 
+ impl Counters {
++    pub(crate) fn resources_declared(&self, count: usize) {
++        self.synchronization[0].fetch_add(count as u64, Ordering::Relaxed);
++    }
++
++    pub(crate) fn scope_barrier(&self) {
++        self.synchronization[1].fetch_add(1, Ordering::Relaxed);
++    }
++
++    pub(crate) fn resource_barrier(&self) {
++        self.synchronization[2].fetch_add(1, Ordering::Relaxed);
++    }
++
++    pub(crate) fn serial_barrier_elided(&self) {
++        self.synchronization[3].fetch_add(1, Ordering::Relaxed);
++    }
++
++    pub(crate) fn fence_updated(&self) {
++        self.synchronization[4].fetch_add(1, Ordering::Relaxed);
++    }
++
++    pub(crate) fn fence_waited(&self) {
++        self.synchronization[5].fetch_add(1, Ordering::Relaxed);
++    }
++
++    pub(crate) fn submission_accesses(&self, summaries: usize, accesses: crate::tracker::Access, host: crate::tracker::Access) {
++        self.synchronization[6].fetch_add(summaries as u64, Ordering::Relaxed);
++        self.synchronization[7].fetch_add(u64::from(!accesses.is_empty()), Ordering::Relaxed);
++        self.synchronization[8].fetch_add(u64::from(!host.is_empty()), Ordering::Relaxed);
++        self.synchronization[9].fetch_add(u64::from(host.is_empty()), Ordering::Relaxed);
++        self.synchronization[12].fetch_or(accesses.stages.as_raw(), Ordering::Relaxed);
++        self.synchronization[13].fetch_or(host.stages.as_raw(), Ordering::Relaxed);
++        self.synchronization[14].fetch_or(accesses.access.as_raw(), Ordering::Relaxed);
++        self.synchronization[15].fetch_or(host.access.as_raw(), Ordering::Relaxed);
++    }
++
++    pub(crate) fn host_write_uses(&self, host: u64, private: u64) {
++        self.synchronization[10].fetch_add(host, Ordering::Relaxed);
++        self.synchronization[11].fetch_add(private, Ordering::Relaxed);
++    }
++
+     /// `count` commands of `kind` were recorded (`PoolCompiled`).
+     pub(crate) fn pool_compiled(&self, kind: PoolCompiled, count: u64) {
+         let counter = match kind {
+@@ -979,6 +1020,15 @@ pub struct WorkCounts {
+ }
+ 
+ impl Device {
++    /// Bounded synchronization totals: declared resources, scope/resource barriers, redundant
++    /// serial barriers, fence updates/waits, submitted summaries, completed-write visibility,
++    /// host visibility/emissions omitted, host/private write uses, then accumulated destination
++    /// stages, host source stages, destination accesses and host source accesses.
++    #[doc(hidden)]
++    pub fn synchronization_counts(&self) -> [u64; 16] {
++        std::array::from_fn(|index| self.shared().counts.synchronization[index].load(Ordering::Relaxed))
++    }
++
+     /// What its commit path did so far (`work_counts.rs`): counts the lanes hold to bounds. No
+     /// Metal counterpart; not part of the API.
+     #[doc(hidden)]

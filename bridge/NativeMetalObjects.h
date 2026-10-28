@@ -26,6 +26,7 @@ typedef struct NmbCommandBuffer NmbCommandBuffer;
 typedef struct NmbEncoder NmbEncoder;
 typedef struct NmbEvent NmbEvent;
 typedef struct NmbFence NmbFence;
+#include "NativeMetalExtended.h"
 
 const char *nmb_last_error(void);
 /* The bridge's embedded AIR fixtures: the runtime's own runtime_examples and kernel_function_constant_gate_fold. */
@@ -141,6 +142,7 @@ struct NmbRenderPipelineDescriptor {
     uint64_t vertex_inputs; /* 0: no vertex descriptor */
     struct NmbVertexAttribute attributes[31];
     struct NmbVertexLayout layouts[31];
+    NmbExtendedRenderPipelineDescriptor extended;
 };
 NmbRenderPipeline *nmb_render_pipeline_new(NmbDevice *, const struct NmbRenderPipelineDescriptor *);
 /* Descriptor binaryArchives and MTLPipelineOption bits. NULL options means defaults.
@@ -213,7 +215,20 @@ void nmb_fence_release(NmbFence *);
 bool nmb_encoder_update_fence(NmbEncoder *, NmbFence *, uint64_t stages);
 bool nmb_encoder_wait_fence(NmbEncoder *, NmbFence *, uint64_t stages);
 
+/* The resource handle is borrowed for this call: kind 0 buffer, 1 texture, 2 indirect command buffer.
+ * use_resources retains its runtime storage until the command buffer completes. */
+struct NmbResourceReference { uint32_t kind; const void *handle; };
+bool nmb_encoder_use_resources(NmbEncoder *, const struct NmbResourceReference *, size_t count, uint64_t usage, uint64_t stages);
+bool nmb_encoder_barrier_scope(NmbEncoder *, uint64_t scope, uint64_t after_stages, uint64_t before_stages);
+bool nmb_encoder_barrier_resources(NmbEncoder *, const struct NmbResourceReference *, size_t count, uint64_t after_stages, uint64_t before_stages);
+/* Cumulative totals: declared resources, scope/resource barriers, omitted serial barriers,
+ * fence updates/waits, submitted summaries, completed-write visibility, host visibility,
+ * batches without host visibility, host/private write uses; then ORs of destination stages,
+ * host source stages, destination accesses and host source accesses. */
+bool nmb_device_synchronization_stats(const NmbDevice *, uint64_t out[16]);
+
 NmbEncoder *nmb_compute_encoder_new(NmbCommandBuffer *);
+NmbEncoder *nmb_compute_encoder_new_with_dispatch_type(NmbCommandBuffer *, uint64_t dispatch_type);
 NmbEncoder *nmb_blit_encoder_new(NmbCommandBuffer *);
 struct NmbPassAttachment {
     NmbTexture *texture;
@@ -224,6 +239,7 @@ struct NmbRenderPassDescriptor {
     struct NmbPassAttachment colors[8], depth, stencil;
     uint64_t width, height, array_length, samples;
     NmbBuffer *visibility; /* the pass's visibility result buffer, or null */
+    NmbExtendedRenderPassDescriptor extended;
 };
 NmbEncoder *nmb_render_encoder_new(NmbCommandBuffer *, const struct NmbRenderPassDescriptor *);
 bool nmb_encoder_end(NmbEncoder *);

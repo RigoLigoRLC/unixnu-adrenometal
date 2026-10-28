@@ -5,7 +5,8 @@
 // Every result comes from the runtime and the GPU: a refused call returns nil/NO with the runtime's reason, an encoder call the runtime
 // refuses fails its command buffer (status Error, handlers run) instead of being dropped. A selector this frontend does not implement is
 // reported through the missing-selector hook before the usual exception, so a hardware run names the gap.
-// Shared events work within this process (no cross-process handle yet). Not yet implemented here: heaps, argument buffers, indirect commands, drawables/presentation.
+// Shared events currently carry process-local handles. Heaps, argument buffers and indirect commands use retained runtime objects;
+// display presentation is owned by the IOSurface and native display path.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurfaceRef.h>
@@ -24,6 +25,11 @@
 #include <mach/mach.h>
 #include "bridge/NativeMetalObjects.h"
 #include "NativeBridgeMetalFrontend.h"
+
+@class NBCommandBuffer;
+static NmbIndirectCommandBuffer *nbExtendedIndirectHandle(id resource);
+static bool nbExtendedRenderPipeline(MTLRenderPipelineDescriptor *descriptor,NmbExtendedRenderPipelineDescriptor *extended,NSError **error);
+static bool nbExtendedRenderPass(MTLRenderPassDescriptor *descriptor,NmbExtendedRenderPassDescriptor *extended,NBCommandBuffer *commandBuffer);
 
 extern "C" void sys_dcache_flush(void *start, size_t length);
 
@@ -100,10 +106,23 @@ static void journal(const std::string &line) {
  if(FILE *f=fopen(gJournalPath.c_str(),"a")){fwrite(line.data(),1,line.size(),f);fputc('\n',f);fclose(f);}
 }
 
-@interface NBObject : NSObject
+static std::atomic<uint64_t> gObjectTraceSequence{1};
+
+@interface NBObject : NSObject {
+ uint64_t _traceObjectID;
+}
 @property(atomic,copy) NSString *label;
 @end
 @implementation NBObject
+- (instancetype)init {
+ if ((self = [super init])) {
+  _traceObjectID = gObjectTraceSequence.fetch_add(1, std::memory_order_relaxed);
+ }
+ return self;
+}
+- (uint64_t)globalTraceObjectID {
+ return _traceObjectID;
+}
 - (id<MTLDevice>)device {return gDeviceObject;}
 - (void)doesNotRecognizeSelector:(SEL)selector {
  if(gMissing)gMissing(class_getName(object_getClass(self)),sel_getName(selector));
@@ -606,12 +625,59 @@ static void waitForResource(id resource) {
 - (void)offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
  [self check:nmb_encoder_set_buffer_offset(_handle,stage,offset,(uint32_t)index) what:"setBufferOffset"];
 }
+- (bool)resourceReferences:(const id<MTLResource> __unsafe_unretained [])resources count:(NSUInteger)count into:(std::vector<NmbResourceReference> &)references {
+ if(count && !resources) {
+  [_commandBuffer refuse:@"missing resource list"];
+  return false;
+ }
+
+ references.reserve(count);
+ for(NSUInteger index=0;index<count;index++) {
+  id resource=resources[index];
+  if([resource isKindOfClass:[NBBuffer class]]) {
+   references.push_back({0,[(NBBuffer *)resource handle]});
+  } else if([resource isKindOfClass:[NBTexture class]]) {
+   references.push_back({1,[(NBTexture *)resource handle]});
+  } else if(NmbIndirectCommandBuffer *indirect=nbExtendedIndirectHandle(resource)) {
+   references.push_back({2,indirect});
+  } else {
+   [_commandBuffer refuse:@"missing or foreign resource"];
+   return false;
+  }
+ }
+
+ for(NSUInteger index=0;index<count;index++) {
+  id resource=resources[index];
+  [_commandBuffer.resourceOwners addObject:resource];
+  if(!gDeviceHostCoherent && [resource isKindOfClass:[NBTexture class]] && [(NBTexture *)resource surface]) {
+   [_commandBuffer.surfaces addObject:resource];
+  }
+ }
+ return true;
+}
+- (void)useResources:(const id<MTLResource> __unsafe_unretained [])resources count:(NSUInteger)count usage:(MTLResourceUsage)usage renderStages:(uint64_t)stages {
+ std::vector<NmbResourceReference> references;
+ if(![self resourceReferences:resources count:count into:references]) {
+  return;
+ }
+ [self check:nmb_encoder_use_resources(_handle,references.data(),references.size(),usage,stages) what:"useResources"];
+}
+- (void)barrierResources:(const id<MTLResource> __unsafe_unretained [])resources count:(NSUInteger)count after:(uint64_t)after before:(uint64_t)before {
+ std::vector<NmbResourceReference> references;
+ if(![self resourceReferences:resources count:count into:references]) {
+  return;
+ }
+ [self check:nmb_encoder_barrier_resources(_handle,references.data(),references.size(),after,before) what:"memoryBarrierWithResources"];
+}
 @end
 
 @interface NBComputeEncoder : NBEncoder
+@property(nonatomic) MTLDispatchType configuredDispatchType;
 @end
 @implementation NBComputeEncoder
-- (MTLDispatchType)dispatchType {return MTLDispatchTypeSerial;}
+- (MTLDispatchType)dispatchType {
+ return self.configuredDispatchType;
+}
 - (void)setComputePipelineState:(id<MTLComputePipelineState>)state {
  if(![(id)state isKindOfClass:[NBComputePipeline class]]){[self.commandBuffer refuse:@"foreign compute pipeline"];return;}
  [self check:nmb_compute_set_pipeline(self.handle,[(NBComputePipeline *)state handle]) what:"setComputePipelineState"];
@@ -637,8 +703,19 @@ static void waitForResource(id resource) {
 }
 - (void)dispatchThreads:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:true];}
 - (void)dispatchThreadgroups:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:false];}
-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u {(void)r;(void)u;}
-- (void)memoryBarrierWithScope:(MTLBarrierScope)s {(void)s;}
+- (void)useResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage {
+ __unsafe_unretained id<MTLResource> resources[]={resource};
+ [self useResources:resources count:1 usage:usage renderStages:0];
+}
+- (void)useResources:(const id<MTLResource> __unsafe_unretained [])resources count:(NSUInteger)count usage:(MTLResourceUsage)usage {
+ [self useResources:resources count:count usage:usage renderStages:0];
+}
+- (void)memoryBarrierWithScope:(MTLBarrierScope)scope {
+ [self check:nmb_encoder_barrier_scope(self.handle,scope,0,0) what:"memoryBarrierWithScope"];
+}
+- (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained [])resources count:(NSUInteger)count {
+ [self barrierResources:resources count:count after:0 before:0];
+}
 @end
 
 @interface NBRenderEncoder : NBEncoder
@@ -736,7 +813,19 @@ static void waitForResource(id resource) {
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o {
  [self drawIndexedPrimitives:t indexCount:n indexType:k indexBuffer:b indexBufferOffset:o instanceCount:1 baseVertex:0 baseInstance:0];
 }
-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {(void)r;(void)u;(void)s;}
+- (void)useResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage stages:(MTLRenderStages)stages {
+ __unsafe_unretained id<MTLResource> resources[]={resource};
+ [self useResources:resources count:1 usage:usage renderStages:stages];
+}
+- (void)useResources:(const id<MTLResource> __unsafe_unretained [])resources count:(NSUInteger)count usage:(MTLResourceUsage)usage stages:(MTLRenderStages)stages {
+ [self useResources:resources count:count usage:usage renderStages:stages];
+}
+- (void)memoryBarrierWithScope:(MTLBarrierScope)scope afterStages:(MTLRenderStages)after beforeStages:(MTLRenderStages)before {
+ [self check:nmb_encoder_barrier_scope(self.handle,scope,after,before) what:"memoryBarrierWithScope"];
+}
+- (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained [])resources count:(NSUInteger)count afterStages:(MTLRenderStages)after beforeStages:(MTLRenderStages)before {
+ [self barrierResources:resources count:count after:after before:before];
+}
 - (void)updateFence:(id<MTLFence>)fence afterStages:(MTLRenderStages)stages {[self fence:fence stages:stages update:true];}
 - (void)waitForFence:(id<MTLFence>)fence beforeStages:(MTLRenderStages)stages {[self fence:fence stages:stages update:false];}
 @end
@@ -858,11 +947,20 @@ static void scheduled(void *context);
  encoder.handle=handle;encoder.commandBuffer=self;return encoder;
 }
 - (id<MTLComputeCommandEncoder>)computeCommandEncoder {
- return [self encoder:[NBComputeEncoder new] handle:self.committed?nullptr:nmb_compute_encoder_new(_handle) what:@"computeCommandEncoder"];
+ return [self computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
 }
 - (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDispatchType:(MTLDispatchType)type {
- if(type!=MTLDispatchTypeSerial){[self refuse:@"concurrent compute dispatch"];return nil;}
- return [self computeCommandEncoder];
+ NBComputeEncoder *encoder=[NBComputeEncoder new];
+ encoder.configuredDispatchType=type;
+ NmbEncoder *handle=self.committed?nullptr:nmb_compute_encoder_new_with_dispatch_type(_handle,type);
+ return [self encoder:encoder handle:handle what:@"computeCommandEncoderWithDispatchType"];
+}
+- (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDescriptor:(MTLComputePassDescriptor *)descriptor {
+ if(!descriptor) {
+  [self refuse:@"computeCommandEncoderWithDescriptor requires a descriptor"];
+  return nil;
+ }
+ return [self computeCommandEncoderWithDispatchType:descriptor.dispatchType];
 }
 - (id<MTLBlitCommandEncoder>)blitCommandEncoder {
  gBlits++;encodedWork.blits++;
@@ -902,6 +1000,9 @@ static void scheduled(void *context);
   if(![(id)d.visibilityResultBuffer isKindOfClass:[NBBuffer class]]){[self refuse:@"foreign visibility result buffer"];return nil;}
   [_resourceOwners addObject:d.visibilityResultBuffer];
   pass.visibility=[(NBBuffer *)d.visibilityResultBuffer handle];
+ }
+ if(!nbExtendedRenderPass(d,&pass.extended,self)) {
+  return nil;
  }
  return [self encoder:[NBRenderEncoder new] handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
 }
@@ -1182,7 +1283,7 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
    if(a.bufferIndex<31){MTLVertexBufferLayoutDescriptor *l=v.layouts[a.bufferIndex];p->layouts[a.bufferIndex]={l.stride,(uint64_t)l.stepFunction,l.stepRate};}
   }
  }
- return true;
+ return nbExtendedRenderPipeline(d,&p->extended,error);
 }
 
 // ---- heaps ----
@@ -1298,6 +1399,26 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 @interface NBDeviceMethods : NSObject
 @end
 @implementation NBDeviceMethods
+- (NSUInteger)maxIOCommandsInFlight {
+ // The inherited Metal IO queue bounds its file workers with this device limit.
+ return 16;
+}
+- (void)getDefaultSamplePositions:(MTLSamplePosition *)positions count:(NSUInteger)count {
+ NmbSamplePosition locations[4] = {};
+ if (!positions || count > 4) {
+  [NSException raise:NSInvalidArgumentException format:@"invalid default sample-position output or count %lu", (unsigned long)count];
+  return;
+ }
+
+ if (!nmb_device_default_sample_positions(gDevice, locations, count)) {
+  [NSException raise:NSInvalidArgumentException format:@"default sample positions: %@", lastError()];
+  return;
+ }
+
+ for (NSUInteger index = 0; index < count; ++index) {
+  positions[index] = MTLSamplePositionMake(locations[index].x, locations[index].y);
+ }
+}
 - (NSString *)name {return gName;}
 - (uint64_t)registryID {return gRegistryID;}
 - (NSUInteger)maxBufferLength {return nmb_device_max_buffer_length(gDevice);}
@@ -1542,6 +1663,8 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 }
 @end
 
+#include "NativeBridgeMetalExtended.inc"
+
 // The device queries the runtime answers (nmb_device_answer_selector), as methods of the device class. One without an argument is read once
 // and installed only where the device has an answer of its own; one with an argument asks the runtime each call, and a refusal answers 0/NO
 // with the reason logged.
@@ -1619,6 +1742,9 @@ extern "C" bool native_bridge_metal_shader_cache_stats(NmbShaderCacheStats *out)
 }
 extern "C" bool native_bridge_metal_work_stats(uint64_t out[10]) {
  return gDevice && nmb_device_work_stats(gDevice,out);
+}
+extern "C" bool native_bridge_metal_synchronization_stats(uint64_t out[16]) {
+ return gDevice && nmb_device_synchronization_stats(gDevice,out);
 }
 
 extern "C" size_t native_bridge_metal_status(char *out,size_t size) {
@@ -1739,6 +1865,14 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  row("J completed wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeWaitCompleted.count.load(),ms(gTimeWaitCompleted.total.load()),ms(gTimeWaitCompleted.slowest.load()));
  row("J resource wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeResourceWait.count.load(),ms(gTimeResourceWait.total.load()),ms(gTimeResourceWait.slowest.load()));
  row("J resource checks=%llu skipped=%llu",(unsigned long long)gResourceChecks.load(),(unsigned long long)gResourceSkipped.load());
+ uint64_t synchronization[16]={};
+ if(native_bridge_metal_synchronization_stats(synchronization)) {
+  auto total=[&](size_t index){return (unsigned long long)synchronization[index];};
+  row("J resources=%llu scope=%llu resourcebarrier=%llu serialskip=%llu",total(0),total(1),total(2),total(3));
+  row("J fence update=%llu wait=%llu summaries=%llu acquire=%llu",total(4),total(5),total(6),total(7));
+  row("J hostbarrier=%llu hostskip=%llu hostwrites=%llu privatewrites=%llu",total(8),total(9),total(10),total(11));
+  row("J stages acquire=%llx host=%llx access acquire=%llx host=%llx",total(12),total(13),total(14),total(15));
+ }
  row("J surface cache driver=%u n=%llu bytes=%llu dup=%llu us=%llu max=%llu",gDeviceHostCoherent?1U:0U,(unsigned long long)gTimeSurfaceFlush.count.load(),
   (unsigned long long)gSurfaceFlushBytes.load(),(unsigned long long)gSurfaceFlushDuplicates.load(),
   (unsigned long long)gTimeSurfaceFlush.total.load(),(unsigned long long)gTimeSurfaceFlush.slowest.load());
