@@ -197,7 +197,7 @@ index ca40777..8e68ed6 100644
      let attachments = [vk::AttachmentDescription::default()
          .format(format.into())
 diff --git a/crates/metal2vulkan-runtime/src/depth_stencil_resolve.rs b/crates/metal2vulkan-runtime/src/depth_stencil_resolve.rs
-index 6fc8d92..96b0a6c 100644
+index 6fc8d92..60e7e87 100644
 --- a/crates/metal2vulkan-runtime/src/depth_stencil_resolve.rs
 +++ b/crates/metal2vulkan-runtime/src/depth_stencil_resolve.rs
 @@ -18,7 +18,9 @@
@@ -484,7 +484,7 @@ index 6fc8d92..96b0a6c 100644
 +                    layout.extent,
 +                    Some(bits),
 +                )?);
-+                remaining &= !ImageAspectFlags::DEPTH;
++                remaining = remaining.difference(ImageAspectFlags::DEPTH);
 +            }
 +            if let Some(drawn) = Drawn::of(remaining) {
 +                draws.push(ResolveDraw::plan(
@@ -756,7 +756,7 @@ index b63c88d..bbcbacd 100644
              F::PostDepthCoverage => {
                  first([not_implemented(Feature::Lowering(LowerFamily::Fragment))])
 diff --git a/crates/metal2vulkan-runtime/src/image_plan.rs b/crates/metal2vulkan-runtime/src/image_plan.rs
-index dc67ef8..f160a84 100644
+index dc67ef8..096485f 100644
 --- a/crates/metal2vulkan-runtime/src/image_plan.rs
 +++ b/crates/metal2vulkan-runtime/src/image_plan.rs
 @@ -31,7 +31,9 @@
@@ -812,7 +812,7 @@ index dc67ef8..f160a84 100644
 +            && layout.samples > 1
 +            && profile.supports_format(direct, FormatUsage::SampledImage)
 +        {
-+            image_usage &= !ImageUsageFlags::TRANSIENT_ATTACHMENT;
++            image_usage = image_usage.difference(ImageUsageFlags::TRANSIENT_ATTACHMENT);
 +            image_usage |= ImageUsageFlags::SAMPLED;
 +        }
          return Ok(ImagePlan {
