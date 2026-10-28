@@ -2,9 +2,9 @@
 
 Metal frontend through metal2vulkan and Turnip.
 
-`unixnu-sm-t733` contains submission, synchronization and memory optimizations.
-`unixnu-sm-t733-apple3` adds the Apple3 frontend, compiler and format paths.
-The system SDR policy observer is a separate commit on the Apple3 branch.
+`unixnu-sm-t733` contains submission, synchronization and memory optimizations
+with the system SDR format policy observer. `unixnu-sm-t733-apple3` adds the
+Apple3 frontend, compiler and format paths on the same optimization base.
 
 [Tessellation and indirect command execution](TESSELLATION_AND_ICB_2026-10-28.md)
 describes draw-supplied control-point counts, valid empty index ranges, and render
