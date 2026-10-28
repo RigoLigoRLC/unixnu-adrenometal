@@ -19,6 +19,7 @@
 #include "CacheExport.h"
 #include "PrimeShaders.h"
 #include "ExceptionDiag.h"
+#include "NativeAdrenoSystemFormatPolicy.h"
 
 @interface _MTLDevice : NSObject
 @end
@@ -199,6 +200,10 @@ static id clientDevice(unsigned port) {
     return device;
 }
 static id deviceForPort(unsigned port) {
+    char policyPath[1024];
+    if (requestedPath("NativeAdrenoMetal.display-policy", policyPath, sizeof(policyPath))) {
+        systemformatpolicy::start(policyPath);
+    }
     static id device;
     static bool tried;
     @synchronized([NativeAdrenoMetalDeviceBase class]) {
@@ -321,6 +326,13 @@ static id deviceForPort(unsigned port) {
                     snprintf(text, sizeof text, "ST%u %.57s", step - 1, full + (size_t)(step - 1) * 57);
                 }
                 streamText(*g, text);
+                static unsigned reportedFormatPolicy = ~0u;
+                unsigned formatPolicy = systemformatpolicy::statusCode();
+                if (formatPolicy != reportedFormatPolicy) {
+                    systemformatpolicy::status(text, sizeof(text));
+                    streamText(*g, text);
+                    reportedFormatPolicy = formatPolicy;
+                }
 #if NATIVE_ADRENO_QUARTZCORE_DISPLAY_STATE
                 reportDisplayState(*g);
 #endif
