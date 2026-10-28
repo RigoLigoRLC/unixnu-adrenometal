@@ -456,9 +456,21 @@ pub extern "C" fn nmb_indirect_command_memory(command: *mut NmbIndirectCommand, 
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn nmb_indirect_command_region(command: *mut NmbIndirectCommand, region_origin: *const u64, region_size: *const u64) -> bool {
+pub extern "C" fn nmb_indirect_command_region(
+    command: *mut NmbIndirectCommand,
+    region_origin: *const u64,
+    region_size: *const u64,
+) -> bool {
     guard(false, || {
-        extended_compute(command)?.set_stage_in_region(Region::new(origin(region_origin)?, size(region_size)?)).map_err(e("indirect command stage region"))?;
+        let region = Region {
+            origin: origin(region_origin)?,
+            size: size(region_size)?,
+        };
+
+        extended_compute(command)?
+            .set_stage_in_region(region)
+            .map_err(e("indirect command stage region"))?;
+
         Ok(true)
     })
 }
