@@ -2,6 +2,10 @@
 
 Metal frontend through metal2vulkan and Turnip.
 
+`unixnu-sm-t733` contains submission, synchronization and memory optimizations
+with the system SDR format policy observer. `unixnu-sm-t733-apple3` adds the
+Apple3 frontend, compiler and format paths on the same optimization base.
+
 The frontend uses metal2vulkan and Turnip with the kernel GPU interface and selected OS ABI. GPU composition has been verified on sheng with A740.
 
 The runtime keeps separate buffer and image memory pools for each Vulkan memory
