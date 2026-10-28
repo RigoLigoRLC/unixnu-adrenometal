@@ -1,0 +1,804 @@
+diff --git a/crates/metal2vulkan-runtime/build.rs b/crates/metal2vulkan-runtime/build.rs
+index df266f0..ba616f1 100644
+--- a/crates/metal2vulkan-runtime/build.rs
++++ b/crates/metal2vulkan-runtime/build.rs
+@@ -8,6 +8,7 @@ use std::fs;
+ use std::path::{Path, PathBuf};
+ 
+ fn main() {
++    compile_pvrtc();
+     let mut files = vec![PathBuf::from("Cargo.toml"), PathBuf::from("build.rs")];
+     collect(Path::new("src"), &mut files);
+     files.sort();
+@@ -29,6 +30,41 @@ fn main() {
+     );
+ }
+ 
++fn compile_pvrtc() {
++    use std::process::Command;
++
++    let source = Path::new("src/texture/pvrtc_decode.comp");
++    let output = PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo OUT_DIR"))
++        .join("pvrtc_decode.spv");
++    println!("cargo:rerun-if-env-changed=M2V_GLSL_COMPILER");
++    println!("cargo:rerun-if-changed={}", source.display());
++
++    let configured = std::env::var_os("M2V_GLSL_COMPILER");
++    let candidates: Vec<PathBuf> = match configured {
++        Some(path) => vec![path.into()],
++        None => ["glslc", "glslangValidator", "glslang", "/opt/homebrew/bin/glslc", "/opt/homebrew/bin/glslangValidator"]
++            .into_iter().map(PathBuf::from).collect(),
++    };
++    for compiler in candidates {
++        let glslang = compiler.file_name().is_some_and(|name| name == "glslangValidator" || name == "glslang");
++        let mut command = Command::new(&compiler);
++        if glslang {
++            command.args(["-V", "--target-env", "vulkan1.2", "-S", "comp"]);
++        } else {
++            command.args(["--target-env=vulkan1.2", "-fshader-stage=compute", "-O"]);
++        }
++        let result = command.arg(source).arg("-o").arg(&output).output();
++        match result {
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
++            Err(error) => panic!("start {}: {error}", compiler.display()),
++            Ok(result) if result.status.success() => return,
++            Ok(result) => panic!("PVRTC shader compilation with {} failed: {}{}", compiler.display(),
++                String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr)),
++        }
++    }
++    panic!("PVRTC shader compilation requires glslc or glslangValidator; set M2V_GLSL_COMPILER to its host executable");
++}
++
+ fn collect(directory: &Path, output: &mut Vec<PathBuf>) {
+     let entries = fs::read_dir(directory)
+         .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()));
+diff --git a/crates/metal2vulkan-runtime/src/families/formats.rs b/crates/metal2vulkan-runtime/src/families/formats.rs
+index 7b917ce..25f221e 100644
+--- a/crates/metal2vulkan-runtime/src/families/formats.rs
++++ b/crates/metal2vulkan-runtime/src/families/formats.rs
+@@ -292,6 +292,25 @@ pub(crate) fn answers(
+                 Missing::Refused(Unsupported::not_representable(Feature::Format))
+             }
+         })?;
++        if crate::pvrtc::holds_blocks(&plan) && usage == TextureUsage::SHADER_READ {
++            check_image_limits(&plan, texture_type, &limits(&plan)).map_err(Missing::Refused)?;
++            let decoded_layout = TextureLayout {
++                pixel_format: crate::pvrtc::sampled_format(pf),
++                ..layout
++            };
++            let decoded = plan_image(&decoded_layout, usage, false, facts).map_err(|refusal| match refusal {
++                ImageRefusal::Unsupported(unsupported) => Missing::Refused(unsupported),
++                _ => Missing::Refused(Unsupported::not_representable(Feature::Format)),
++            })?;
++            check_image_limits(&decoded, texture_type, &limits(&decoded)).map_err(Missing::Refused)?;
++            let needed = metal2vulkan::vk::FormatFeatureFlags2::SAMPLED_IMAGE
++                | metal2vulkan::vk::FormatFeatureFlags2::SAMPLED_IMAGE_FILTER_LINEAR
++                | metal2vulkan::vk::FormatFeatureFlags2::TRANSFER_DST;
++            if facts.optimal(decoded.format).contains(needed) {
++                return Ok(decoded);
++            }
++            return Err(Missing::Refused(lacking(pf, usage, decoded.format, profile)));
++        }
+         if plan.unavailable.intersects(usage) {
+             return Err(Missing::Refused(lacking(pf, usage, plan.format, profile)));
+         }
+diff --git a/crates/metal2vulkan-runtime/src/heap_sets.rs b/crates/metal2vulkan-runtime/src/heap_sets.rs
+index 270994a..2b4860a 100644
+--- a/crates/metal2vulkan-runtime/src/heap_sets.rs
++++ b/crates/metal2vulkan-runtime/src/heap_sets.rs
+@@ -840,7 +840,7 @@ impl Notes {
+             let blocks = texture
+                 .image_plan()
+                 .is_ok_and(super::pvrtc::holds_for_copies);
+-            if blocks {
++            if blocks && texture.pvrtc_sample_format().is_none() {
+                 self.unreadable = Some(texture.clone());
+             }
+         }
+@@ -1173,6 +1173,12 @@ pub(super) struct HeapUse {
+ }
+ 
+ impl HeapUse {
++    /// The command buffer reads a sampler table even when every texture sample uses raw texels
++    /// and no Vulkan sampler array is bound. Its commit keeps the listing counted until completion.
++    pub(super) fn list_sampler_metadata(&mut self) {
++        self.lists_samplers = true;
++    }
++
+     /// Whether a command bound a heap set.
+     pub(super) fn bound(&self) -> bool {
+         !self.versions.is_empty()
+@@ -1495,19 +1501,22 @@ pub(super) fn fit_samplers(
+     let Some(set) = set else {
+         return true;
+     };
+-    let capacity = u64::from(set.bindings.iter().map(|b| b.count).min().unwrap_or(0));
++    let Some(capacity) = set
++        .bindings
++        .iter()
++        .filter(|b| b.ty == metal2vulkan::vk::DescriptorType::SAMPLER)
++        .map(|b| b.count)
++        .min()
++    else {
++        return true;
++    };
++    let capacity = u64::from(capacity);
+     let fits = |sampler: &SamplerState| sampler.heap_element() < capacity;
+     if samplers.iter().all(fits) {
+         return true;
+     }
+-    if set
+-        .bindings
+-        .iter()
+-        .any(|b| b.ty == metal2vulkan::vk::DescriptorType::SAMPLER)
+-    {
+-        let past = samplers.iter().find(|sampler| !fits(sampler));
+-        *unlisted = past.map(|sampler| (sampler.gpu_resource_id().0, capacity));
+-    }
++    let past = samplers.iter().find(|sampler| !fits(sampler));
++    *unlisted = past.map(|sampler| (sampler.gpu_resource_id().0, capacity));
+     samplers.retain(fits);
+     false
+ }
+diff --git a/crates/metal2vulkan-runtime/src/owned_kernel.rs b/crates/metal2vulkan-runtime/src/owned_kernel.rs
+index d2968cf..73a3d4c 100644
+--- a/crates/metal2vulkan-runtime/src/owned_kernel.rs
++++ b/crates/metal2vulkan-runtime/src/owned_kernel.rs
+@@ -115,6 +115,8 @@ pub(super) enum OwnedModule {
+     /// `bind::block_decode_module` of one decode: a BC1 to BC5 texture's written region decoded
+     /// as Metal decodes it into its decoded twin (`texture/decoded_twin.rs`).
+     BlockDecode(BlockDecode),
++    /// PVRTC endpoint interpolation and modulation into the texture's RGBA8 twin.
++    PvrtcDecode,
+ }
+ 
+ impl OwnedModule {
+@@ -139,6 +141,13 @@ impl OwnedModule {
+     /// [`images`](Self::images)), and its push bytes.
+     fn build(self, device: &Device) -> Result<(Vec<u32>, u32, u32), Error> {
+         match self {
++            OwnedModule::PvrtcDecode => {
++                let bytes = include_bytes!(concat!(env!("OUT_DIR"), "/pvrtc_decode.spv"));
++                let words = bytes.chunks_exact(4)
++                    .map(|word| u32::from_le_bytes(word.try_into().expect("SPIR-V word")))
++                    .collect();
++                Ok((words, 3, 0))
++            }
+             OwnedModule::VisibilityResolve => {
+                 let module = metal2vulkan::bind::visibility_resolve_module(device.compile_device())
+                     .map_err(Error::Compile)?;
+@@ -345,6 +354,7 @@ pub(super) struct OwnedKernels {
+     extended_shadow_loads: HashMap<ExtendedRange, OwnedKernel>,
+     predication_step: Option<OwnedKernel>,
+     block_decodes: HashMap<BlockDecode, OwnedKernel>,
++    pvrtc_decode: Option<OwnedKernel>,
+ }
+ 
+ impl OwnedKernels {
+@@ -370,6 +380,7 @@ impl OwnedKernels {
+             self.tile_reach,
+             self.capture_settle,
+             self.predication_step,
++            self.pvrtc_decode,
+         ]
+         .into_iter()
+         .flatten()
+@@ -465,6 +476,7 @@ impl OwnedKernels {
+             OwnedModule::TileReach => &mut self.tile_reach,
+             OwnedModule::CaptureSettle => &mut self.capture_settle,
+             OwnedModule::PredicationStep => &mut self.predication_step,
++            OwnedModule::PvrtcDecode => &mut self.pvrtc_decode,
+         })
+     }
+ }
+diff --git a/crates/metal2vulkan-runtime/src/pvrtc.rs b/crates/metal2vulkan-runtime/src/pvrtc.rs
+index 8815f27..bbffc4f 100644
+--- a/crates/metal2vulkan-runtime/src/pvrtc.rs
++++ b/crates/metal2vulkan-runtime/src/pvrtc.rs
+@@ -1,5 +1,5 @@
+-//! PVRTC textures on a device without a format for them: their blocks held as raw bytes, which
+-//! copies move and nothing reads.
++//! PVRTC textures on a device without a native format keep their compressed blocks
++//! in a carrier image and sample a cached RGBA8 image decoded on the GPU.
+ //!
+ //! - **Metal's answers** (an M4 under macOS 27.0.1, EV SPCrp-probe7-m4, alike plain twice and
+ //!   under API validation where it passes): every PVRTC format makes a texture, `Private` and
+@@ -35,17 +35,20 @@
+ //!   than one: a PVRTC texture is square with a power-of-two side (`texture_descriptor`), so the
+ //!   half-width image's level `l`, `max(1, w / 2^(l+1))` wide, holds `ceil(max(1, w / 2^l) / 8)`
+ //!   blocks across, as the texture's does.
+-//! - **What it serves.** Copies only: copies between buffers and the texture, row by row and in
++//! - **Copies.** Copies between buffers and the texture, row by row and in
+ //!   block order, and copies between textures (`blit_texture.rs`), and the CPU's copies of whole
+ //!   levels in their order (`Texture::replace_region` and `get_bytes`, through rows,
+-//!   [`rows_of_cpu_order`]). Sampling, shader reads and writes and
+-//!   rendering need a decoder the runtime does not have: the texture is made, as Metal makes it,
+-//!   and a command that binds it is refused with the format's own refusal (its representation's
+-//!   `NotImplemented`, or the extension it needs).
++//!   [`rows_of_cpu_order`]). Owned textures and textures in the heap's own memory
++//!   have a decoded twin (`texture/decoded_twin/pvrtc.rs`). CPU uploads and GPU
++//!   blits refresh each affected mip level and layer on the GPU. The decoder
++//!   handles RGB/RGBA, two/four-bit blocks, wrapped endpoint interpolation and
++//!   modulation; sRGB views read the decoded codes through an RGBA8 sRGB view.
++//!   Shader writes and rendering into PVRTC remain invalid format usages.
+ //! - **Through handles.** A function that reads texture handles from memory may reach such a
+ //!   texture made resident, or bound in a stage that reads handles, and the runtime does not know
+-//!   which of the textures it reaches the function reads: the handle's element is the neutral
+-//!   texture, nothing is refused, and the command announces it once
++//!   which of the textures it reaches the function reads. A decoded twin supplies
++//!   the handle's sampled view. Where an external texture has no twin, its
++//!   handle's element is neutral and the command announces it once
+ //!   ([`Degradation::UnreadableHandleTexture`], `degrade_unreadable`).
+ //! - **Not yet:** the CPU's copies of a region other than a whole level, and of a whole level at
+ //!   another `bytesPerRow` than 0 and its row (`NotImplemented(PvrtcBlockOrder)`). A blit's at a
+@@ -87,8 +90,17 @@ pub(super) fn is_pvrtc(pf: PixelFormat) -> bool {
+     )
+ }
+ 
++/// The RGBA8 view of a PVRTC decoded image, retaining the original sRGB transfer.
++pub(super) fn sampled_format(pf: PixelFormat) -> PixelFormat {
++    use PixelFormat as P;
++    match pf {
++        P::PVRTCRGB2BPPSRGB | P::PVRTCRGB4BPPSRGB | P::PVRTCRGBA2BPPSRGB | P::PVRTCRGBA4BPPSRGB => P::RGBA8UnormSRGB,
++        _ => P::RGBA8Unorm,
++    }
++}
++
+ /// Whether `pf` is a PVRTC format of 8 x 4 blocks (2 bits a pixel).
+-fn two_bits(pf: PixelFormat) -> bool {
++pub(super) fn two_bits(pf: PixelFormat) -> bool {
+     use PixelFormat as P;
+     matches!(block_family(pf), P::PVRTCRGB2BPP | P::PVRTCRGBA2BPP)
+ }
+@@ -248,7 +260,7 @@ pub(super) fn degrade_unreadable<'a>(
+ ) {
+     let Some((texture, carrier)) = textures.into_iter().find_map(|texture| {
+         let plan = texture.image_plan().ok()?;
+-        holds_for_copies(plan).then_some((texture, plan.format))
++        (holds_for_copies(plan) && texture.pvrtc_sample_format().is_none()).then_some((texture, plan.format))
+     }) else {
+         return;
+     };
+diff --git a/crates/metal2vulkan-runtime/src/texture/PVRTC-LICENSE.txt b/crates/metal2vulkan-runtime/src/texture/PVRTC-LICENSE.txt
+new file mode 100644
+index 0000000..e8f9186
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/texture/PVRTC-LICENSE.txt
+@@ -0,0 +1,21 @@
++The MIT License (MIT)
++Copyright (c) Imagination Technologies Ltd.
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++The above copyright notice and this permission notice shall be included in
++all copies or substantial portions of the Software.
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++THE SOFTWARE.
++
++Reference implementation:
++https://github.com/powervr-graphics/Native_SDK/blob/master/framework/PVRCore/texture/PVRTDecompress.cpp
+diff --git a/crates/metal2vulkan-runtime/src/texture/decoded_twin.rs b/crates/metal2vulkan-runtime/src/texture/decoded_twin.rs
+index e64c7fb..7f9f98c 100644
+--- a/crates/metal2vulkan-runtime/src/texture/decoded_twin.rs
++++ b/crates/metal2vulkan-runtime/src/texture/decoded_twin.rs
+@@ -1,4 +1,8 @@
+-//! Decoded twins of BC1 to BC5 textures (the fitted decode).
++//! Decoded images for BC1 to BC5 and PVRTC textures.
++//!
++//! PVRTC uses the GPU pass in `decoded_twin/pvrtc.rs`. Its decoder needs the
++//! current neighboring blocks, so CPU uploads and GPU blits update its twin on
++//! the submission queue. The compressed image remains the copy/readback source.
+ //!
+ //! **Why.** Metal decodes a BC1 to BC5 block by rules of its own (`bind::BlockDecode`: 6-bit
+ //! weights, BC7's; fitted bit for bit on an Apple M4), which Vulkan leaves to the implementation.
+@@ -81,6 +85,8 @@ use metal2vulkan::vk::{
+ };
+ use std::sync::{Arc, Weak};
+ 
++mod pvrtc;
++
+ /// The most bytes of texels one band of a decode pass holds: its scratch's texels (and fewer
+ /// blocks), within `maxStorageBufferRange`.
+ pub(crate) const BAND_BYTES: u64 = 32 << 20;
+@@ -91,6 +97,8 @@ pub(super) struct Decoded {
+     pub(super) image: Image,
+     /// How the BC image's blocks decode.
+     pub(super) decode: BlockDecode,
++    /// The PVRTC format whose neighboring endpoints the GPU interpolates.
++    pvrtc: Option<metal2vulkan::metal::PixelFormat>,
+     /// It was made moved alone (`Start::Moved`): its texels start as the CPU's decode of the zero
+     /// blocks, written as the texture is made ([`Texture::start_decoded_twin`]).
+     started_on_the_cpu: bool,
+@@ -103,6 +111,9 @@ impl Decoded {
+     fn view_format(&self, format: Format) -> Option<Format> {
+         use BlockDecode as D;
+         use Format as F;
++        if self.pvrtc.is_some() {
++            return matches!(format, F::R8G8B8A8_UNORM | F::R8G8B8A8_SRGB).then_some(format);
++        }
+         match (self.decode, format) {
+             (D::Bc1, F::BC1_RGBA_SRGB_BLOCK)
+             | (D::Bc2, F::BC2_SRGB_BLOCK)
+@@ -132,7 +143,10 @@ impl Decoded {
+                 let [w, h, d] = plan.extent.map(|axis| u64::from((axis >> level).max(1)));
+                 let layers = u64::from(plan.layers);
+                 let texels = w * h * d * layers * u64::from(decode.texel_bytes());
+-                let blocks = w.div_ceil(4) * h.div_ceil(4) * d * layers;
++                let block_width = self.pvrtc.map_or(4, |format| {
++                    if crate::pvrtc::two_bits(format) { 8 } else { 4 }
++                });
++                let blocks = w.div_ceil(block_width) * h.div_ceil(4) * d * layers;
+                 (texels, blocks * u64::from(decode.block_bytes()))
+             })
+             .fold((0, 0), |(t, b), (texels, blocks)| (t + texels, b + blocks))
+@@ -208,15 +222,28 @@ impl Device {
+         descriptor: &TextureDescriptor,
+         fresh: bool,
+     ) -> Result<Image, Error> {
+-        let Some(decode) = self.twin_decode(layout) else {
++        let pvrtc = super::super::pvrtc::holds_blocks(image.plan()).then_some(layout.pixel_format);
++        let Some(decode) = pvrtc.map(|_| BlockDecode::Bc1).or_else(|| self.twin_decode(layout)) else {
+             self.degrade_block_decode(layout);
+             return Ok(image);
+         };
+         // A twin starts, and takes the CPU's decodes, as the BC image's CPU copies go: on the
+         // host or the staging queue where they do (then made as a `Shared` or `Managed`
+         // texture's image is), else through submissions.
++        // PVRTC interpolation reads neighboring blocks. Its writes and decode run
++        // on the same GPU queue so a region update sees the other current blocks.
++        if pvrtc.is_some() {
++            image.host_copies = false;
++            image.staging_copies = false;
++        }
+         let routed = image.host_copies || image.staging_copies;
+-        let plan = twin_plan(image.plan(), decode, routed);
++        let mut plan = twin_plan(image.plan(), decode, routed);
++        if pvrtc.is_some() {
++            plan.extent = layout.extent;
++            if matches!(layout.texture_type, metal2vulkan::metal::TextureType::Cube | metal2vulkan::metal::TextureType::CubeArray) {
++                plan.flags |= ImageCreateFlags::CUBE_COMPATIBLE;
++            }
++        }
+         let facts = self
+             .shared()
+             .textures
+@@ -228,6 +255,11 @@ impl Device {
+             self.degrade_block_decode(layout);
+             return Ok(image);
+         }
++        if pvrtc.is_some_and(|format| crate::pvrtc::sampled_format(format) == metal2vulkan::metal::PixelFormat::RGBA8UnormSRGB)
++            && !facts.optimal(Format::R8G8B8A8_SRGB).contains(needs)
++        {
++            return Ok(image);
++        }
+         let mut own = *descriptor;
+         if !routed {
+             own.resource_options = ResourceOptions::private();
+@@ -256,7 +288,8 @@ impl Device {
+         }
+         // A new BC1 texture's zero blocks are three-color blocks of black, alpha 1; every other
+         // format's decode to zero, which the twin's first move writes.
+-        if fresh && decode == BlockDecode::Bc1 && !routed {
++        let opaque_zero = pvrtc.map_or(decode == BlockDecode::Bc1, pvrtc::opaque);
++        if fresh && opaque_zero && !routed {
+             let plan = twin.plan();
+             let black = vk::ClearColorValue {
+                 float32: [0.0, 0.0, 0.0, 1.0],
+@@ -273,6 +306,7 @@ impl Device {
+         let decoded = Decoded {
+             image: twin,
+             decode,
++            pvrtc,
+             started_on_the_cpu: routed && fresh,
+         };
+         self.degrade_decoded_twin(layout, &decoded, placed(&image));
+@@ -322,7 +356,11 @@ impl Texture {
+         let Some(decoded) = image.decoded.as_deref() else {
+             return Ok(None);
+         };
+-        let same = BlockDecode::of(self.0.record.pixel_format) == Some(decoded.decode);
++        let same = match decoded.pvrtc {
++            Some(format) => super::super::image_plan::block_family(format)
++                == super::super::image_plan::block_family(self.0.record.pixel_format),
++            None => BlockDecode::of(self.0.record.pixel_format) == Some(decoded.decode),
++        };
+         let Some(format) = decoded.view_format(desc.format).filter(|_| same) else {
+             return Ok(None);
+         };
+@@ -682,6 +720,9 @@ impl Image {
+         let Some(decoded) = self.decoded.as_deref() else {
+             return Ok(None);
+         };
++        if let Some(format) = decoded.pvrtc {
++            return self.pvrtc_decode_pass(decoded, format, regions, scratch);
++        }
+         let decode = decoded.decode;
+         let device = &self.device;
+         let limits = &device.properties().description.limits;
+@@ -777,10 +818,10 @@ impl Image {
+             .zip(&sets.sets)
+             .zip(groups)
+             .map(|(((region, &(_, texels_at, _)), &set), groups)| Step {
+-                blocks: vk::BufferImageCopy {
++                blocks: vec![vk::BufferImageCopy {
+                     buffer_offset: base,
+                     ..buffer_image_copy(region)
+-                },
++                }],
+                 texels: vk::BufferImageCopy {
+                     buffer_offset: base + texels_at,
+                     ..buffer_image_copy(region)
+@@ -890,7 +931,7 @@ pub(crate) fn bands(region: &ImageRegion, texel: u64, block: u64, most: u64) ->
+ /// One band of a decode pass: its blocks copied out of the BC image, its set, its workgroups and
+ /// its texels copied into the twin.
+ struct Step {
+-    blocks: vk::BufferImageCopy,
++    blocks: Vec<vk::BufferImageCopy>,
+     texels: vk::BufferImageCopy,
+     set: vk::DescriptorSet,
+     groups: [u32; 3],
+@@ -949,8 +990,7 @@ impl DecodePass {
+             Barrier::everything().record(device, raw);
+             device.cmd_bind_pipeline(raw, compute, self.pipeline);
+             for step in &self.steps {
+-                let blocks = std::slice::from_ref(&step.blocks);
+-                device.cmd_copy_image_to_buffer(raw, self.image, general, self.scratch, blocks);
++                device.cmd_copy_image_to_buffer(raw, self.image, general, self.scratch, &step.blocks);
+                 Barrier::everything().record(device, raw);
+                 let set = std::slice::from_ref(&step.set);
+                 device.cmd_bind_descriptor_sets(raw, compute, self.layout, 0, set, &[]);
+diff --git a/crates/metal2vulkan-runtime/src/texture/decoded_twin/pvrtc.rs b/crates/metal2vulkan-runtime/src/texture/decoded_twin/pvrtc.rs
+new file mode 100644
+index 0000000..19365bf
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/texture/decoded_twin/pvrtc.rs
+@@ -0,0 +1,183 @@
++// SPDX-License-Identifier: MIT
++
++use super::*;
++use metal2vulkan::metal::PixelFormat;
++use std::collections::BTreeSet;
++
++pub(super) fn opaque(format: PixelFormat) -> bool {
++    use PixelFormat as P;
++    matches!(format, P::PVRTCRGB2BPP | P::PVRTCRGB2BPPSRGB | P::PVRTCRGB4BPP | P::PVRTCRGB4BPPSRGB)
++}
++
++fn two_bits(format: PixelFormat) -> bool {
++    use PixelFormat as P;
++    matches!(format, P::PVRTCRGB2BPP | P::PVRTCRGB2BPPSRGB | P::PVRTCRGBA2BPP | P::PVRTCRGBA2BPPSRGB)
++}
++
++/// PvrtcBand names one output strip and the wrapped block rows it reads.
++/// Every strip spans the mip level's width. One block row on each side supplies
++/// the neighboring endpoints and the interpolated two-bit modulation values.
++struct PvrtcBand {
++    level: u32,
++    layer: u32,
++    width: u32,
++    height: u32,
++    first_y: u32,
++    band_height: u32,
++    across: u32,
++    down: u32,
++    first_row: u32,
++    rows: u32,
++    blocks_bytes: u64,
++    texels_at: u64,
++    texels_bytes: u64,
++}
++
++impl Image {
++    /// The GPU pass decodes each written mip level and layer into the cached
++    /// RGBA8 image. A write changes neighboring texels, including across an edge;
++    /// refreshing the whole affected level preserves those interpolation inputs.
++    pub(super) fn pvrtc_decode_pass(
++        &self,
++        decoded: &Decoded,
++        format: PixelFormat,
++        regions: &[ImageRegion],
++        scratch: PassScratch,
++    ) -> Result<Option<DecodePass>, Error> {
++        let mut subresources = BTreeSet::new();
++        for region in regions {
++            if region.size.contains(&0) {
++                continue;
++            }
++            for layer in region.layer..region.layer + region.layers {
++                subresources.insert((region.level, layer));
++            }
++        }
++        if subresources.is_empty() {
++            return Ok(None);
++        }
++
++        let device = &self.device;
++        let limits = &device.properties().description.limits;
++        let align = limits.min_storage_buffer_offset_alignment.max(16);
++        let most = u64::from(limits.max_storage_buffer_range).min(BAND_BYTES);
++        let two = two_bits(format);
++        let block_width = if two { 8 } else { 4 };
++        let plan = decoded.image.plan();
++        let mut bands = Vec::new();
++        for (level, layer) in subresources {
++            let width = (plan.extent[0] >> level).max(1);
++            let height = (plan.extent[1] >> level).max(1);
++            let across = width.div_ceil(block_width);
++            let down = height.div_ceil(4);
++            let row_bytes = u64::from(across) * 8;
++            let row_pair = u64::from(width) * 16 + row_bytes;
++            let available = most.saturating_sub(row_bytes * 2 + align);
++            let band_rows = (available / row_pair).max(1).min(u64::from(down)) as u32;
++            for first_y in (0..height).step_by((band_rows * 4) as usize) {
++                let band_height = (band_rows * 4).min(height - first_y);
++                let rows = (band_height.div_ceil(4) + 2).min(down);
++                let first_row = (first_y / 4 + down - 1) % down;
++                let blocks_bytes = row_bytes * u64::from(rows);
++                let texels_at = blocks_bytes.div_ceil(align) * align;
++                let texels_bytes = u64::from(width) * u64::from(band_height) * 4;
++                if texels_at + texels_bytes > most + align {
++                    return Err(internal("PVRTC decode strip exceeds its scratch limit"));
++                }
++                bands.push(PvrtcBand { level, layer, width, height, first_y, band_height,
++                    across, down, first_row, rows, blocks_bytes, texels_at, texels_bytes });
++            }
++        }
++
++        let needed = bands.iter().map(|b| b.texels_at + b.texels_bytes).max().unwrap_or(0);
++        let (scratch, raw_scratch, base, bytes) = match scratch {
++            PassScratch::Own => {
++                let own = device.own_buffer(needed, ResourceOptions::private())?;
++                let (raw, base) = own.at(0);
++                (Some(own), raw, base, needed)
++            }
++            PassScratch::Device => {
++                let firsts = &device.shared().textures.first_moves;
++                (None, firsts.decode_scratch(device, most + align)?, 0, 0)
++            }
++        };
++        const SHAPE_BYTES: u64 = 40;
++        let slot = SHAPE_BYTES.div_ceil(align) * align;
++        let shapes = device.write_combined_buffer(bands.len() as u64 * slot)?;
++        let (raw_shapes, shapes_base) = shapes.at(0);
++        if !base.is_multiple_of(align) || !shapes_base.is_multiple_of(align) {
++            return Err(internal("PVRTC decode buffers do not satisfy descriptor alignment"));
++        }
++        let contents = shapes.contents().ok_or_else(|| internal("PVRTC shapes without host memory"))?;
++        for (index, band) in bands.iter().enumerate() {
++            let values = [band.width, band.height, band.first_y, band.band_height,
++                band.across, band.down, band.first_row, band.rows, u32::from(two), u32::from(opaque(format))];
++            for (word, value) in values.into_iter().enumerate() {
++                let bytes = value.to_le_bytes();
++                // SAFETY: every shape has its aligned 40-byte slot in this live buffer.
++                unsafe {
++                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), contents.as_ptr().add(index * slot as usize + word * 4), 4);
++                }
++            }
++        }
++        let kernel = device.owned_kernel(OwnedModule::PvrtcDecode)?;
++        let ranges: Vec<Vec<(vk::Buffer, u64, u64)>> = bands.iter().enumerate().map(|(index, band)| {
++            vec![(raw_shapes, shapes_base + index as u64 * slot, SHAPE_BYTES),
++                (raw_scratch, base, band.blocks_bytes),
++                (raw_scratch, base + band.texels_at, band.texels_bytes)]
++        }).collect();
++        let sets = OwnedSets::write(device, &kernel, &ranges)?;
++        let mut steps = Vec::with_capacity(bands.len());
++        for (band, &set) in bands.iter().zip(&sets.sets) {
++            let carrier_width = (self.plan().extent[0] >> band.level).max(1);
++            let carrier_height = (self.plan().extent[1] >> band.level).max(1);
++            let mut blocks = Vec::with_capacity(2);
++            let mut left = band.rows;
++            let mut row = band.first_row;
++            let mut offset = base;
++            while left != 0 {
++                let rows = left.min(band.down - row);
++                let region = ImageRegion {
++                    aspect: ImageAspectFlags::COLOR,
++                    level: band.level, layer: band.layer, layers: 1,
++                    origin: [0, row * 4, 0],
++                    size: [carrier_width, (rows * 4).min(carrier_height - row * 4), 1],
++                };
++                blocks.push(vk::BufferImageCopy { buffer_offset: offset, ..buffer_image_copy(&region) });
++                offset += u64::from(rows) * u64::from(band.across) * 8;
++                left -= rows;
++                row = 0;
++            }
++            let region = ImageRegion {
++                aspect: ImageAspectFlags::COLOR,
++                level: band.level, layer: band.layer, layers: 1,
++                origin: [0, band.first_y, 0],
++                size: [band.width, band.band_height, 1],
++            };
++            steps.push(Step {
++                blocks,
++                texels: vk::BufferImageCopy { buffer_offset: base + band.texels_at, ..buffer_image_copy(&region) },
++                set,
++                groups: [band.width.div_ceil(8), band.band_height.div_ceil(8), 1],
++            });
++        }
++        device.shared().counts.block_decode_pass();
++        Ok(Some(DecodePass {
++            image: self.raw.get(), twin: decoded.image.raw.get(), scratch: raw_scratch,
++            pipeline: kernel.pipeline, layout: kernel.layout, steps, bytes,
++            held: Held { _scratch: scratch, _shapes: shapes, _sets: sets },
++        }))
++    }
++}
++
++impl Texture {
++    pub(crate) fn pvrtc_sample_format(&self) -> Option<PixelFormat> {
++        let image = view_shadow::truth(self.image().ok()?);
++        let original = image.decoded.as_deref()?.pvrtc?;
++        if super::super::super::image_plan::block_family(original)
++            != super::super::super::image_plan::block_family(self.pixel_format()) {
++            return None;
++        }
++        Some(crate::pvrtc::sampled_format(self.pixel_format()))
++    }
++}
+diff --git a/crates/metal2vulkan-runtime/src/texture/pvrtc_decode.comp b/crates/metal2vulkan-runtime/src/texture/pvrtc_decode.comp
+new file mode 100644
+index 0000000..1db6758
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/texture/pvrtc_decode.comp
+@@ -0,0 +1,151 @@
++// SPDX-License-Identifier: MIT
++// Copyright (c) Imagination Technologies Ltd.
++// The endpoint and modulation rules follow Native_SDK PVRTDecompress.cpp.
++// The accompanying PVRTC-LICENSE.txt preserves its permission notice.
++#version 450
++
++layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
++layout(set = 0, binding = 0, std430) readonly buffer Shape {
++    uint width;
++    uint height;
++    uint first_y;
++    uint band_height;
++    uint blocks_across;
++    uint blocks_down;
++    uint first_block_row;
++    uint block_rows;
++    uint two_bits;
++    uint opaque;
++} shape;
++layout(set = 0, binding = 1, std430) readonly buffer Blocks {
++    uint words[];
++} source;
++layout(set = 0, binding = 2, std430) writeonly buffer Texels {
++    uint words[];
++} target;
++
++uint wrap(int value, uint count) {
++    int remainder = value % int(count);
++    return uint(remainder < 0 ? remainder + int(count) : remainder);
++}
++
++uvec2 blockAt(ivec2 block) {
++    uint x = wrap(block.x, shape.blocks_across);
++    uint y = wrap(block.y, shape.blocks_down);
++    uint row = (y + shape.blocks_down - shape.first_block_row) % shape.blocks_down;
++    uint at = (row * shape.blocks_across + x) * 2;
++    return uvec2(source.words[at], source.words[at + 1]);
++}
++
++uvec4 colorA(uint color) {
++    if ((color & 0x8000u) != 0) {
++        return uvec4((color >> 10) & 31u, (color >> 5) & 31u,
++            (color & 30u) | ((color & 30u) >> 4), 15u);
++    }
++    return uvec4(((color & 0xf00u) >> 7) | ((color & 0xf00u) >> 11),
++        ((color & 0xf0u) >> 3) | ((color & 0xf0u) >> 7),
++        ((color & 0xeu) << 1) | ((color & 0xeu) >> 2), (color & 0x7000u) >> 11);
++}
++
++uvec4 colorB(uint color) {
++    if ((color & 0x80000000u) != 0) {
++        return uvec4((color >> 26) & 31u, (color >> 21) & 31u, (color >> 16) & 31u, 15u);
++    }
++    return uvec4(((color & 0xf000000u) >> 23) | ((color & 0xf000000u) >> 27),
++        ((color & 0xf00000u) >> 19) | ((color & 0xf00000u) >> 23),
++        ((color & 0xf0000u) >> 15) | ((color & 0xf0000u) >> 19), (color & 0x70000000u) >> 27);
++}
++
++uvec4 interpolate(uvec4 p, uvec4 q, uvec4 r, uvec4 s, uvec2 position, uint block_width) {
++    uvec4 top = p * (block_width - position.x) + q * position.x;
++    uvec4 bottom = r * (block_width - position.x) + s * position.x;
++    uvec4 sum = top * (4u - position.y) + bottom * position.y;
++    if (shape.two_bits != 0) {
++        return uvec4((sum.rgb >> 7) + (sum.rgb >> 2), (sum.a >> 5) + (sum.a >> 1));
++    }
++    return uvec4((sum.rgb >> 6) + (sum.rgb >> 1), (sum.a >> 4) + sum.a);
++}
++
++uint modeOf(uvec2 block) {
++    if ((block.y & 1u) == 0) {
++        return 0u;
++    }
++    if ((block.x & 1u) == 0) {
++        return 1u;
++    }
++    return (block.x & (1u << 20)) != 0 ? 3u : 2u;
++}
++
++uint weight(uint code) {
++    return code == 0 ? 0u : code == 1 ? 3u : code == 2 ? 5u : 8u;
++}
++
++uint storedWeight(ivec2 position) {
++    uint x = wrap(position.x, shape.blocks_across * 8u);
++    uint y = wrap(position.y, shape.blocks_down * 4u);
++    uvec2 block = blockAt(ivec2(x / 8u, y / 4u));
++    uint local_index = (y % 4u) * 8u + x % 8u;
++    if ((block.y & 1u) == 0) {
++        return ((block.x >> local_index) & 1u) * 8u;
++    }
++    uint bits = block.x;
++    if ((bits & 1u) != 0) {
++        bits = (bits & ~(1u << 20)) | (((bits >> 21) & 1u) << 20);
++    }
++    bits = (bits & ~1u) | ((bits >> 1) & 1u);
++    return weight((bits >> ((local_index / 2u) * 2u)) & 3u);
++}
++
++uint modulation(ivec2 position, uint block_width) {
++    uvec2 block = blockAt(position / ivec2(block_width, 4));
++    if (shape.two_bits == 0) {
++        uint index = uint(position.y % 4) * 4u + uint(position.x % 4);
++        uint code = (block.x >> (index * 2u)) & 3u;
++        if ((block.y & 1u) != 0) {
++            return code == 0 ? 0u : code == 1 ? 4u : code == 2 ? 14u : 8u;
++        }
++        return weight(code);
++    }
++    uint mode = modeOf(block);
++    if (mode == 0 || ((position.x ^ position.y) & 1) == 0) {
++        return storedWeight(position);
++    }
++    uint horizontal = storedWeight(position + ivec2(-1, 0)) + storedWeight(position + ivec2(1, 0));
++    uint vertical = storedWeight(position + ivec2(0, -1)) + storedWeight(position + ivec2(0, 1));
++    if (mode == 1) {
++        return (horizontal + vertical + 2u) / 4u;
++    }
++    return ((mode == 2 ? horizontal : vertical) + 1u) / 2u;
++}
++
++void main() {
++    uvec2 output_position = gl_GlobalInvocationID.xy;
++    if (output_position.x >= shape.width || output_position.y >= shape.band_height) {
++        return;
++    }
++    uvec2 pixel = uvec2(output_position.x, shape.first_y + output_position.y);
++    uint block_width = shape.two_bits != 0 ? 8u : 4u;
++    uvec2 shifted = pixel + uvec2(block_width / 2u, 2u);
++    ivec2 first = ivec2(shifted / uvec2(block_width, 4u)) - ivec2(1);
++    uvec2 local = shifted % uvec2(block_width, 4u);
++    uvec2 p = blockAt(first);
++    uvec2 q = blockAt(first + ivec2(1, 0));
++    uvec2 r = blockAt(first + ivec2(0, 1));
++    uvec2 s = blockAt(first + ivec2(1, 1));
++    uvec4 a = interpolate(colorA(p.y), colorA(q.y), colorA(r.y), colorA(s.y), local, block_width);
++    uvec4 b = interpolate(colorB(p.y), colorB(q.y), colorB(r.y), colorB(s.y), local, block_width);
++    uint mod = modulation(ivec2(pixel), block_width);
++    bool punch = mod > 10u;
++    if (punch) {
++        mod -= 10u;
++    }
++    uvec4 rgba = (a * (8u - mod) + b * mod) / 8u;
++    if (punch) {
++        rgba.a = 0u;
++    }
++    if (shape.opaque != 0) {
++        rgba.a = 255u;
++    }
++    target.words[output_position.y * shape.width + output_position.x] =
++        rgba.r | (rgba.g << 8) | (rgba.b << 16) | (rgba.a << 24);
++}

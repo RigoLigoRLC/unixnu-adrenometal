@@ -1,0 +1,531 @@
+diff --git a/crates/metal2vulkan-runtime/src/sampler_listing.rs b/crates/metal2vulkan-runtime/src/sampler_listing.rs
+index 1ab1ad2..3401500 100644
+--- a/crates/metal2vulkan-runtime/src/sampler_listing.rs
++++ b/crates/metal2vulkan-runtime/src/sampler_listing.rs
+@@ -49,8 +49,9 @@ use std::sync::Arc;
+ pub(super) struct SamplerListing {
+     plan: Arc<BindingPlan>,
+     objects: Arc<VariantObjects>,
+-    /// Set 1 of the command's layout, whose sampler arrays' capacity bounds the elements.
+-    heap: DescriptorSetLayout,
++    /// Set 1 where the command has descriptor arrays. A shader that filters raw texels may
++    /// read only the sampler metadata table and need no sampler array.
++    heap: Option<DescriptorSetLayout>,
+     placement: HeapPlacement,
+     /// The argument samplers the command listed.
+     listed: Vec<ArgumentSampler>,
+@@ -76,7 +77,7 @@ impl SamplerListing {
+         Some(SamplerListing {
+             plan: Arc::clone(plan),
+             objects: Arc::clone(objects),
+-            heap: heap?.clone(),
++            heap: heap.cloned(),
+             placement,
+             listed: listed.to_vec(),
+             tables,
+@@ -96,7 +97,8 @@ impl SamplerListing {
+     ) -> Result<Option<Vec<Arc<OwnedSampler>>>, Error> {
+         let mut live = live.to_vec();
+         let mut unlisted = None;
+-        heap_sets::fit_samplers(Some(&self.heap), &mut live, &mut unlisted);
++        heaps.list_sampler_metadata();
++        heap_sets::fit_samplers(self.heap.as_ref(), &mut live, &mut unlisted);
+         // A state past the command's sampler arrays, which no element of them holds.
+         if let Some(unlisted) = unlisted {
+             heap_sets::degrade_unlisted(device, unlisted, &self.commands);
+diff --git a/crates/metal2vulkan/src/bind/heap.rs b/crates/metal2vulkan/src/bind/heap.rs
+index 84d455d..72c2957 100644
+--- a/crates/metal2vulkan/src/bind/heap.rs
++++ b/crates/metal2vulkan/src/bind/heap.rs
+@@ -140,7 +140,7 @@ use crate::error::{BindError, Feature, Unsupported};
+ use crate::memory::handles::{
+     lookup_host, ENTRY_ELEMENT, ENTRY_FLAGS, ENTRY_ID_HI, ENTRY_ID_LO, FLAG_DEPTH_CODES,
+     FLAG_DEPTH_VALUES, FLAG_OUT_OF_BOUNDS_ALPHA_ONE, FLAG_TEXEL_CLASS, NEUTRAL_ELEMENT,
+-    TABLE_CAPACITY, TABLE_ENTRY_BYTES,
++    SAMPLER_METADATA_LEVEL_BITS, SAMPLER_TABLE_BYTES_PER_ENTRY, TABLE_CAPACITY, TABLE_ENTRY_BYTES,
+ };
+ use crate::metal::format::{
+     is_depth_stencil, sampled_type, storage_choice, vk_format, without_format_gaps, StorageUse,
+@@ -266,7 +266,16 @@ pub(crate) fn fit(shape: &TextureShape, class: &ImageHandleClass) -> Fit {
+     } else {
+         metal::TextureUsage::SHADER_READ
+     };
+-    let shaped = dims(texture_type) == (class.dim, class.arrayed, class.multisampled)
++    let raw_cube = raw_held(shape)
++        && matches!(texture_type, TextureType::Cube | TextureType::CubeArray)
++        && class.access == ImageAccess::Sampled
++        && class.sampled_type == SampledType::Uint
++        && class.dim == ImageDim::D2
++        && class.arrayed
++        && !class.multisampled;
++    // Raw cube fetches address face layers through a 2D array view.
++    let shaped = (dims(texture_type) == (class.dim, class.arrayed, class.multisampled)
++        || raw_cube)
+         && class.dim != ImageDim::Buffer
+         && (sample_count > 1) == class.multisampled
+         && (!class.depth_compare || is_depth_stencil(pixel_format))
+@@ -695,6 +704,44 @@ pub(crate) struct SamplerAdmission {
+     /// The members a sampled heap array holds were checked against an opaque-black border
+     /// (`HeapPlanner::view`).
+     pub opaque_black: bool,
++    /// The actual views sampled through argument samplers, including texture slots. A sampler
++    /// added before commit must satisfy these views' filtering and border requirements.
++    pub sampled_views: Vec<SamplerView>,
++}
++
++/// SamplerView retains one bound sampled image's format and Metal channels. Plan creation and
++/// sampler relisting apply the same filtering and opaque-black border checks to this view.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++pub(crate) struct SamplerView {
++    pixel_format: metal::PixelFormat,
++    swizzle: metal::TextureSwizzleChannels,
++    mapping: metal::format::FormatMapping,
++    compare: bool,
++}
++
++impl SamplerView {
++    fn check(&self, sampler: &SamplerShape, profile: &DeviceProfile) -> Result<(), BindError> {
++        let integer = matches!(
++            sampled_type(self.pixel_format),
++            Some(SampledType::Sint | SampledType::Uint)
++        );
++        let use_ = SamplerUse::new(self.compare, integer);
++        require_filter_features(
++            profile,
++            vk_filtering(sampler, use_),
++            self.compare,
++            self.mapping.format,
++        )?;
++        check_border_view(
++            sampler.opaque_black_border,
++            self.pixel_format,
++            &self.mapping,
++            self.swizzle,
++            profile,
++        )
++        .map_err(bind_error)
++    }
+ }
+ 
+ impl SamplerAdmission {
+@@ -719,6 +766,7 @@ impl SamplerAdmission {
+             .all(|use_| check_sampler(s, use_, profile).is_ok())
+             && self.cubic_held(s)
+             && (!sampled || !s.opaque_black_border || self.opaque_black)
++            && self.sampled_views.iter().all(|view| view.check(s, profile).is_ok())
+     }
+ }
+ 
+@@ -941,6 +989,11 @@ impl<'a> HeapPlanner<'a> {
+             None
+         } else {
+             let a = &shape.argument_samplers;
++            let capacity = if sampler_uses.is_empty() {
++                TABLE_CAPACITY
++            } else {
++                capacity
++            };
+             if a.least_count() > u64::from(capacity) {
+                 return Err(BindError::HeapTooLarge {
+                     count: a.least_count(),
+@@ -972,6 +1025,7 @@ impl<'a> HeapPlanner<'a> {
+                     .collect(),
+                 cubic: sampler_tables.iter().all(|&(stage, ..)| tested(stage)),
+                 opaque_black: false,
++                sampled_views: Vec::new(),
+             };
+             if !a.shapes.iter().all(|s| admission.cubic_held(s)) {
+                 return Err(BindError::Unsupported(Unsupported::not_implemented(
+@@ -1051,6 +1105,52 @@ impl<'a> HeapPlanner<'a> {
+         }))
+     }
+ 
++    /// The sampled texture slot's actual view is checked against listed argument samplers and
++    /// retained in their admission rules for states listed when the command buffer commits.
++    pub fn sampled_texture(
++        &mut self,
++        shape: &BindShape,
++        slot: SlotRef,
++        compare: bool,
++        source: &WriteSource,
++    ) -> Result<(), BindError> {
++        let WriteSource::Texture { view, .. } = source else {
++            return Ok(());
++        };
++        let Some(TextureShape::Texture { pixel_format, swizzle, .. }) = shape
++            .stages
++            .get(&slot.stage)
++            .and_then(|stage| stage.textures.get(&slot.index))
++        else {
++            return Err(internal("a sampled texture view without its bound texture"));
++        };
++        let mut mapping = vk_format(*pixel_format, &[FormatUsage::SampledImage].into(), self.profile)
++            .map_err(bind_error)?;
++        mapping.format = view.format;
++        mapping.components = view.components;
++        mapping.aspects = view.aspect;
++        let seen = SamplerView {
++            pixel_format: *pixel_format,
++            swizzle: if view.shader_swizzle {
++                metal::TextureSwizzleChannels::DEFAULT
++            } else {
++                *swizzle
++            },
++            mapping,
++            compare,
++        };
++        let Some((samplers, _, admission)) = self.samplers.as_mut() else {
++            return Err(internal("a sampled texture slot without its argument samplers"));
++        };
++        for sampler in &samplers.shapes {
++            seen.check(sampler, self.profile)?;
++        }
++        if !admission.sampled_views.contains(&seen) {
++            admission.sampled_views.push(seen);
++        }
++        Ok(())
++    }
++
+     /// The write of `stage`'s handle table at `(set, binding)`.
+     pub fn table(
+         &mut self,
+@@ -1093,7 +1193,7 @@ impl<'a> HeapPlanner<'a> {
+         }
+         let entries = self.sampler_entries()?;
+         let bytes_len = entries
+-            .checked_mul(TABLE_ENTRY_BYTES)
++            .checked_mul(SAMPLER_TABLE_BYTES_PER_ENTRY)
+             .ok_or_else(|| internal("a sampler table beyond u32 bytes"))?;
+         self.planned_samplers.push(PlannedHandleTable {
+             set,
+@@ -1849,13 +1949,58 @@ fn listed_sampler_tables(
+                 continue;
+             }
+             let element = placed(i, s.placed_at(), placement)?;
+-            entries.push((s.resource_id, element, SamplerWord::of(&s.desc).0));
++            let min_level = metal::sampler::query_min_level(&s.desc);
++            let max_level = metal::sampler::query_max_level(&s.desc);
++            let bounds = min_level | (max_level << SAMPLER_METADATA_LEVEL_BITS);
++            let anisotropy = metal::sampler::anisotropy_degree(&s.desc);
++            entries.push((
++                s.resource_id,
++                element,
++                SamplerWord::of(&s.desc).0,
++                bounds,
++                anisotropy,
++            ));
+         }
+-        out.push(table_of(t, entries)?);
++        out.push(sampler_table_of(t, entries)?);
+     }
+     Ok(out)
+ }
+ 
++/// The sampler descriptor contains sorted lookup entries followed by matching metadata records.
++/// Deduplication keeps the lowest heap element for each resource ID. Both arrays receive the
++/// same leading null entries, so a lookup's entry index selects its own bounds and anisotropy.
++fn sampler_table_of(
++    t: &PlannedHandleTable,
++    mut entries: Vec<(u64, u32, u32, u32, u32)>,
++) -> Result<crate::bind::instantiate::DescriptorBytes, BindError> {
++    entries.sort_unstable();
++    entries.dedup_by_key(|e| e.0);
++    let len = t.entries as usize;
++    if entries.len() >= len {
++        return Err(internal("a sampler table over its planned length"));
++    }
++    let null_count = len - entries.len();
++    let mut bytes = Vec::with_capacity(len * SAMPLER_TABLE_BYTES_PER_ENTRY as usize);
++    let null = handle_entry(0, NEUTRAL_ELEMENT, 0);
++    for _ in 0..null_count {
++        bytes.extend_from_slice(&null);
++    }
++    for &(id, element, word, _, _) in &entries {
++        bytes.extend_from_slice(&handle_entry(id, element, word));
++    }
++    for _ in 0..null_count {
++        bytes.extend_from_slice(&null);
++    }
++    for &(_, _, _, bounds, anisotropy) in &entries {
++        bytes.extend_from_slice(&handle_entry(0, bounds, anisotropy));
++    }
++    Ok(crate::bind::instantiate::DescriptorBytes {
++        set: t.set,
++        binding: t.binding,
++        bytes,
++    })
++}
++
+ /// Whether the plan of a pipeline of `dependencies` for a bind shape of function tables `shape`
+ /// reads the tables through their device addresses (`VariantKey::addressed_function_tables`): a
+ /// pipeline compiled so states it, and one that reads tables by their ids otherwise asks for it
+@@ -2060,11 +2205,15 @@ fn heap_elements(
+         .iter()
+         .map(|m| element(member_id(m, &used, state)?))
+         .collect::<Result<_, _>>()?;
+-    let samplers = state
+-        .argument_samplers
+-        .iter()
+-        .map(|s| element(Some(s.placed_at())))
+-        .collect::<Result<_, _>>()?;
++    let samplers = if template.sampler_admission.classes.is_empty() {
++        Vec::new()
++    } else {
++        state
++            .argument_samplers
++            .iter()
++            .map(|s| element(Some(s.placed_at())))
++            .collect::<Result<_, _>>()?
++    };
+     let function_tables = match template.function_tables {
+         Some(_) => state
+             .function_tables
+diff --git a/crates/metal2vulkan/src/bind/heap/tests.rs b/crates/metal2vulkan/src/bind/heap/tests.rs
+index 70e39ec..5a8c8db 100644
+--- a/crates/metal2vulkan/src/bind/heap/tests.rs
++++ b/crates/metal2vulkan/src/bind/heap/tests.rs
+@@ -878,6 +878,7 @@ fn sampler_tables_relist_states_of_the_plans_shapes() {
+             }],
+             cubic: true,
+             opaque_black: false,
++            sampled_views: Vec::new(),
+         },
+         ..ResourceTemplate::default()
+     };
+@@ -981,6 +982,7 @@ fn a_late_cubic_sampler_is_listed_with_its_cubic_bit_beside_tested_stages() {
+             }],
+             cubic: tested,
+             opaque_black: false,
++            sampled_views: Vec::new(),
+         },
+         ..ResourceTemplate::default()
+     };
+@@ -1050,6 +1052,7 @@ fn sampler_tables_admit_the_shapes_the_plan_s_checks_pass() {
+             classes,
+             cubic: true,
+             opaque_black,
++            sampled_views: Vec::new(),
+         },
+         ..ResourceTemplate::default()
+     };
+diff --git a/crates/metal2vulkan/src/lower/access/handle.rs b/crates/metal2vulkan/src/lower/access/handle.rs
+index 4709850..18f301c 100644
+--- a/crates/metal2vulkan/src/lower/access/handle.rs
++++ b/crates/metal2vulkan/src/lower/access/handle.rs
+@@ -877,7 +877,7 @@ pub fn declare_sampler_table(mb: &mut ModuleBuilder, plan: &Plan) -> BResult<Opt
+         return Ok(None);
+     };
+     let sym = sampler_table_symbol(plan.stage);
+-    let table = handles::declare_table(mb, sym, ids == HandleIds::U64)?;
++    let table = handles::declare_sampler_table(mb, sym, ids == HandleIds::U64)?;
+     let lookup = handles::define_lookup(mb, table, handles::Lookup::Entry)?;
+     Ok(Some(HandleTable { lookup, table }))
+ }
+diff --git a/crates/metal2vulkan/src/lower/sampler/heap_metadata.rs b/crates/metal2vulkan/src/lower/sampler/heap_metadata.rs
+new file mode 100644
+index 0000000..41dcd2c
+--- /dev/null
++++ b/crates/metal2vulkan/src/lower/sampler/heap_metadata.rs
+@@ -0,0 +1,59 @@
++//! Sampler state read through an argument-buffer handle's entry in the sampler table.
++//!
++//! The lookup array keeps its 16-byte entries. Its equally sized trailing array holds each
++//! entry's mip clamps and anisotropy. The binder writes both arrays at encoding and refreshes
++//! both when it lists live sampler states at commit. The shader uses the lookup result's entry
++//! index, including entry zero for a missing handle, to read the corresponding metadata.
++
++use crate::air::ir::ValueId;
++use crate::lower::emit::EmitCx;
++use crate::memory::handles::{
++    EntryField, SAMPLER_METADATA_LEVEL_BITS, entry_field, sampler_metadata_index,
++};
++use crate::spirv::builder::FunctionBuilder;
++use crate::spirv::error::BResult;
++use crate::spirv::ids::Value as SValue;
++use crate::spirv::ir::BinOp;
++
++/// Metadata contains the sampler's state word and the numeric parameters of shader filtering.
++pub(super) struct Metadata {
++    /// SamplerWord contains filtering, addressing, coordinates and comparison fields.
++    pub word: SValue,
++    /// The minimum mip bound in units of 1/64, after the sampler's mip-selection rule.
++    pub min_level: SValue,
++    /// The maximum mip bound in units of 1/64, after the sampler's mip-selection rule.
++    pub max_level: SValue,
++    /// The base-two logarithm of the anisotropy degree: zero is isotropic.
++    pub anisotropy: SValue,
++}
++
++/// The estimate covers three table loads, the metadata index, and both packed-clamp fields.
++pub(super) const WORDS: u32 = 192;
++
++/// The sampler handle is the table entry index emitted by the argument-buffer ID lookup.
++pub(super) fn read(
++    cx: &mut EmitCx<'_>,
++    fb: &mut FunctionBuilder<'_>,
++    handle: ValueId,
++) -> BResult<Metadata> {
++    let Some(table) = cx.decl.families.access.sampler_table else {
++        return Err(cx.fail("an argument-buffer sampler without its metadata table"));
++    };
++    let entry = cx.operand(fb, handle)?;
++    let word = entry_field(fb, table.table, entry, EntryField::Flags)?;
++    let metadata = sampler_metadata_index(fb, table.table, entry)?;
++    let bounds = entry_field(fb, table.table, metadata, EntryField::Element)?;
++    let anisotropy = entry_field(fb, table.table, metadata, EntryField::Flags)?;
++    let mask = fb.u32_const((1 << SAMPLER_METADATA_LEVEL_BITS) - 1)?;
++    let mask = fb.module().const_value(mask)?;
++    let shift = fb.u32_const(SAMPLER_METADATA_LEVEL_BITS)?;
++    let shift = fb.module().const_value(shift)?;
++    let min_level = fb.binary(BinOp::BitwiseAnd, bounds, mask)?;
++    let max_level = fb.binary(BinOp::ShiftRightLogical, bounds, shift)?;
++    Ok(Metadata {
++        word,
++        min_level,
++        max_level,
++        anisotropy,
++    })
++}
+diff --git a/crates/metal2vulkan/src/memory/handles.rs b/crates/metal2vulkan/src/memory/handles.rs
+index f204e28..3e7ef42 100644
+--- a/crates/metal2vulkan/src/memory/handles.rs
++++ b/crates/metal2vulkan/src/memory/handles.rs
+@@ -379,6 +379,12 @@ fn walk_roots(
+ pub const NEUTRAL_ELEMENT: u32 = 0;
+ /// Bytes of one handle-table entry.
+ pub const TABLE_ENTRY_BYTES: u32 = 16;
++/// Bytes per sampler lookup entry and its corresponding metadata record. Both records retain
++/// the handle table's 16-byte stride; all lookup records precede all metadata records.
++pub const SAMPLER_TABLE_BYTES_PER_ENTRY: u32 = TABLE_ENTRY_BYTES * 2;
++/// Bits of each mip clamp in a sampler metadata record's element word: minimum first,
++/// maximum second, each in sixty-fourths of a mip level.
++pub const SAMPLER_METADATA_LEVEL_BITS: u32 = 16;
+ /// Words of one handle-table entry: the resource id's low and high words, the element, the flags.
+ const ENTRY_WORDS: u32 = 4;
+ /// Word of an entry holding the resource id's low 32 bits.
+@@ -1248,6 +1254,8 @@ pub struct Table {
+     /// in one instruction; `None` for a word view `{ u32 words[]; }`, which compares an id's two
+     /// words.
+     u64_ty: Option<TypeId>,
++    /// The descriptor has an equally sized metadata array after its lookup entries.
++    sampler_metadata: bool,
+ }
+ 
+ /// Declare the handle table at binding symbol `sym`: an entry array when `int64` (the profile
+@@ -1259,6 +1267,7 @@ pub fn declare_table(mb: &mut ModuleBuilder, sym: ResourceSlot, int64: bool) ->
+             global: v.global,
+             u32_ty: v.u32_ty,
+             u64_ty: None,
++            sampler_metadata: false,
+         });
+     }
+     let int = |width| SType::Int {
+@@ -1286,9 +1295,23 @@ pub fn declare_table(mb: &mut ModuleBuilder, sym: ResourceSlot, int64: bool) ->
+         global,
+         u32_ty,
+         u64_ty: Some(u64_ty),
++        sampler_metadata: false,
+     })
+ }
+ 
++/// The sampler table has ordinary lookup entries followed by one metadata record per entry.
++/// Searches and sampler handles address the first array. The metadata records hold packed
++/// mip bounds in their element word and the anisotropy degree's logarithm in their flags word.
++pub fn declare_sampler_table(
++    mb: &mut ModuleBuilder,
++    sym: ResourceSlot,
++    int64: bool,
++) -> BResult<Table> {
++    let mut table = declare_table(mb, sym, int64)?;
++    table.sampler_metadata = true;
++    Ok(table)
++}
++
+ /// `a ≤ b` for two 64-bit values held as `(low, high)` word pairs.
+ fn le64(fb: &mut FunctionBuilder<'_>, a: (SValue, SValue), b: (SValue, SValue)) -> BResult<SValue> {
+     let hi_lt = fb.binary(BinOp::ULessThan, a.1, b.1)?;
+@@ -1414,9 +1437,8 @@ pub fn entry_field(
+     }
+ }
+ 
+-/// The index of the last entry of the handle table `t` (its largest id's), from its length
+-/// (`OpArrayLength`): the null entry's, 0, where the table holds no other.
+-pub fn last_entry(fb: &mut FunctionBuilder<'_>, t: Table) -> BResult<SValue> {
++/// The number of lookup entries in `t`, excluding a sampler table's trailing metadata records.
++fn entry_count(fb: &mut FunctionBuilder<'_>, t: Table) -> BResult<SValue> {
+     let base_ptr = fb.module().global_value(t.global)?;
+     let len = fb.array_length(base_ptr, 0)?;
+     let count = match t.u64_ty {
+@@ -1426,6 +1448,29 @@ pub fn last_entry(fb: &mut FunctionBuilder<'_>, t: Table) -> BResult<SValue> {
+             fb.binary(BinOp::ShiftRightLogical, len, two)?
+         }
+     };
++    if t.sampler_metadata {
++        let one = k32(fb, 1)?;
++        fb.binary(BinOp::ShiftRightLogical, count, one)
++    } else {
++        Ok(count)
++    }
++}
++
++/// The metadata record corresponding to sampler lookup entry `k`. The caller reads its element
++/// and flags with `entry_field`; `t` must come from `declare_sampler_table`.
++pub fn sampler_metadata_index(
++    fb: &mut FunctionBuilder<'_>,
++    t: Table,
++    k: SValue,
++) -> BResult<SValue> {
++    let count = entry_count(fb, t)?;
++    fb.binary(BinOp::IAdd, count, k)
++}
++
++/// The index of the last lookup entry of `t`, excluding sampler metadata: the null entry's, 0,
++/// where the table holds no other.
++pub fn last_entry(fb: &mut FunctionBuilder<'_>, t: Table) -> BResult<SValue> {
++    let count = entry_count(fb, t)?;
+     let one = k32(fb, 1)?;
+     fb.binary(BinOp::ISub, count, one)
+ }
+@@ -1446,8 +1491,7 @@ pub fn lookup(
+     hi: SValue,
+     form: Lookup,
+ ) -> BResult<SValue> {
+-    let base_ptr = fb.module().global_value(t.global)?;
+-    let len = fb.array_length(base_ptr, 0)?;
++    let count = entry_count(fb, t)?;
+     let one = k32(fb, 1)?;
+     let zero = k32(fb, 0)?;
+     let words = View {
+@@ -1456,18 +1500,15 @@ pub fn lookup(
+         u32_ty: t.u32_ty,
+     };
+     // The key, and the id of an entry, in the table's form.
+-    let (key, count) = match t.u64_ty {
++    let key = match t.u64_ty {
+         Some(u64_ty) => {
+             let l = fb.convert(ConvOp::UConvert, lo, u64_ty)?;
+             let h = fb.convert(ConvOp::UConvert, hi, u64_ty)?;
+             let s = k32(fb, 32)?;
+             let h = fb.binary(BinOp::ShiftLeftLogical, h, s)?;
+-            (fb.binary(BinOp::BitwiseOr, h, l)?, len)
+-        }
+-        None => {
+-            let two = k32(fb, 2)?;
+-            (lo, fb.binary(BinOp::ShiftRightLogical, len, two)?)
++            fb.binary(BinOp::BitwiseOr, h, l)?
+         }
++        None => lo,
+     };
+     let at_most_key = |fb: &mut FunctionBuilder<'_>, k: SValue| -> BResult<SValue> {
+         match t.u64_ty {
+@@ -1533,7 +1574,8 @@ pub fn lookup(
+ pub fn lookup_routine_words(int64: bool, form: Lookup) -> u32 {
+     let step = if int64 { 48 } else { 96 };
+     let carried = 48 * form.carried().len() as u32;
+-    SEARCH_STEPS * step + 160 + carried
++    let metadata = if form == Lookup::Entry { 16 } else { 0 };
++    SEARCH_STEPS * step + 160 + carried + metadata
+ }
+ 
+ /// Define the module's handle-table search: a function `fn(lo: u32, hi: u32) -> u32`, the heap

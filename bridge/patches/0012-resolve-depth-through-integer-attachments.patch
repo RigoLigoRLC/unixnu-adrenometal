@@ -1,0 +1,1209 @@
+diff --git a/crates/metal2vulkan-runtime/src/attachment_stand_in.rs b/crates/metal2vulkan-runtime/src/attachment_stand_in.rs
+index 2459898..56122df 100644
+--- a/crates/metal2vulkan-runtime/src/attachment_stand_in.rs
++++ b/crates/metal2vulkan-runtime/src/attachment_stand_in.rs
+@@ -74,14 +74,15 @@
+ //! the render area and every layer of a layered pass, between barriers from everything before and
+ //! to everything after.
+ 
++use super::Device;
+ use super::blit::TRANSFER;
+ use super::color_resolve;
+ use super::command_buffer::CommandBuffer;
+ use super::device::lock;
+ use super::encoder::EncoderCore;
+-use super::error::{internal, Error, RuntimeGap};
++use super::error::{Error, RuntimeGap, internal};
+ use super::framebuffer_fetch;
+-use super::image_plan::{sample_count, ImagePlan};
++use super::image_plan::{ImagePlan, sample_count};
+ use super::nan_clear;
+ use super::render_pass::{PassLayout, Target};
+ use super::resource::ResourceKey;
+@@ -89,10 +90,9 @@ use super::sample_positions;
+ use super::texture_descriptor::TextureDescriptor;
+ use super::tracker::{Access, Barrier, Use};
+ use super::values::ResourceOptions;
+-use super::Device;
+ use ash::vk;
+ use metal2vulkan::device::FormatUsage;
+-use metal2vulkan::metal::format::{aspects, FormatMapping};
++use metal2vulkan::metal::format::{FormatMapping, aspects};
+ use metal2vulkan::metal::{PixelFormat, TextureType, TextureUsage};
+ use metal2vulkan::vk::{
+     FormatFeatureFlags2, ImageAspectFlags, ImageCreateFlags, ImageType, ImageUsageFlags,
+@@ -303,17 +303,8 @@ pub(super) fn stand_in_as(
+     if !color && transfer.contains(both) {
+         usage |= ImageUsageFlags::TRANSFER_SRC | ImageUsageFlags::TRANSFER_DST;
+     }
+-    // A multisampled depth/stencil stand-in (a memoryless attachment's backing) is read sampled
+-    // where the device's depth/stencil-colour image copies cannot move its samples: a
+-    // shader-side depth test's split fills the depth's stand-in from it, as the copies of a
+-    // separate texture read one (`depth_stencil_scratch::sampled_candidate`). It is the
+-    // runtime's own image, so no answer the caller sees moves.
+-    let feature = metal2vulkan::error::Feature::FramebufferFetch;
+-    if !color
+-        && multisampled
+-        && super::depth_stencil_scratch::colour_copies_refused(device, feature, aspects).is_some()
+-        && profile.supports_format(format, FormatUsage::SampledImage)
+-    {
++    // Resolve draws and shader depth tests sample the pass's stored depth/stencil samples.
++    if !color && multisampled && profile.supports_format(format, FormatUsage::SampledImage) {
+         usage |= ImageUsageFlags::SAMPLED;
+     }
+     if copies {
+diff --git a/crates/metal2vulkan-runtime/src/degradation.rs b/crates/metal2vulkan-runtime/src/degradation.rs
+index c969b53..0faec66 100644
+--- a/crates/metal2vulkan-runtime/src/degradation.rs
++++ b/crates/metal2vulkan-runtime/src/degradation.rs
+@@ -58,7 +58,7 @@ use super::color_resolve;
+ use super::device::{DebugMessage, Device, MessageKind, MessageSeverity};
+ use super::fragment_imageblock::PassImageblock;
+ use super::render_pass::{ColorTarget, PassLayout, Target};
+-use super::render_target::{self, depth_stencil_steps, HandedDontCare, PassShape};
++use super::render_target::{self, HandedDontCare, PassShape, depth_stencil_steps};
+ use super::render_values::{LoadAction, StoreAction};
+ use super::resolve::ResolveMode;
+ use super::resource::ObjectId;
+@@ -635,6 +635,21 @@ degradations! {
+             "the resolve applies the rules Metal's resolve follows at 2 and 4 samples (or the \
+              device's average, for a format without them), which no Metal answer confirms at \
+              this count";
++        /// A multisample resolve of an extended-range color attachment whose resolve Metal
++        /// averages from values finer than the codes the attachment holds (`BGRA10_XR`'s alpha,
++        /// or an `_sRGB` twin's color;
++        /// `bind::ColorResolveFormat::extended_range`): the crate-owned resolve
++        /// (`color_resolve.rs`) writes a near-equivalent from the codes where a pixel's samples
++        /// differ, and Metal's code where they hold one. Measured against Metal's resolve on the
++        /// M3 Max under macOS 27.0.1 (our probe `xr`, 4096 texels per format at 2 and 4 samples,
++        /// each sample its own value): `BGRA10_XR`'s alpha Metal's in 84% and 88% of texels and
++        /// within a code in every one; an `_sRGB` twin's color in 81% and 85% of channels and
++        /// within a code in 99.5%, at most 7 codes off where the samples' values nearly cancel
++        /// (`runtime_lane::extended_range_resolve`). A linear form's color follows Metal's rule.
++        ExtendedRangeResolve = "extended-range-resolve", Precision,
++            "where a pixel's samples differ, a resolved alpha, or an sRGB color, can differ from \
++             Metal's by a code (an sRGB color by a few where the samples' values nearly cancel): \
++             Metal averages values finer than the codes the attachment holds";
+         /// An attachment stored with `DontCare` (or the multisampled attachment of
+         /// `MultisampleResolve`) is Vulkan's `DONT_CARE`, where Apple's GPU keeps the earlier
+         /// texels unless its tiler overflows. Only on a driver measured to keep the earlier texel
+@@ -1677,6 +1692,14 @@ degradations! {
+         /// (1 - t)| + |y * t|)` of Metal's; a `half` one within `3 * 2^-10 * (|x * (1 - t)| + |y *
+         /// t|) + 2^-23`.
+         NativeMix = "native-mix";
++        /// An extended-range sample derives its mip level from Vulkan's gradient arithmetic.
++        DeviceSampleLevel = "device-sample-level";
++        /// An XR blend keeps the requested factors and mask while rounding each software
++        /// blend step instead of applying the native fast contraction sequence.
++        ExtendedRangeRoundedBlend = "extended-range-rounded-blend";
++        /// XR filtering computes cube edges, mip blends and anisotropic taps from
++        /// decoded floating-point texels.
++        ExtendedRangeSampling = "extended-range-sampling";
+     }
+ }
+ 
+@@ -3009,7 +3032,8 @@ impl Device {
+             .chain(
+                 depth_stencil
+                     .and_then(|ds| ds.resolve.as_ref())
+-                    .and_then(|resolve| resolve.drawn_into.as_ref()),
++                    .into_iter()
++                    .flat_map(|resolve| resolve.drawn_into.iter().map(|(resolve, _)| resolve)),
+             )
+             .find_map(|resolve| resolve.copy_to.as_ref().map(|to| (to, &resolve.attachment)));
+         if let Some((texture, scratch)) = into_scratch {
+@@ -3051,11 +3075,36 @@ impl Device {
+                         color.target.texture.pixel_format(),
+                         color.target.samples
+                     ),
++                    match color_resolve::extended(color.target.texture.pixel_format()) {
++                        Some(_) => "the shader resolves the attachment's XR integer codes".to_owned(),
++                        None => format!(
++                            "the device's `AVERAGE` resolve of {:?} at {} samples is not measured to \
++                             be Metal's",
++                            color.target.format, color.target.samples
++                        ),
++                    },
++                )
++            });
++        }
++        // An extended-range resolve whose rule the codes cannot give (`color_resolve.rs`).
++        let near = colors.clone().find(|color| {
++            color
++                .resolve
++                .as_ref()
++                .and_then(|r| r.shader)
++                .is_some_and(|rules| !rules.exact())
++        });
++        if let Some(color) = near {
++            self.degrade(Degradation::ExtendedRangeResolve, || {
++                (
+                     format!(
+-                        "the device's `AVERAGE` resolve of {:?} at {} samples is not measured to \
+-                         be Metal's",
+-                        color.target.format, color.target.samples
++                        "a resolve of a {:?} color attachment of {} samples",
++                        color.target.texture.pixel_format(),
++                        color.target.samples
+                     ),
++                    "Metal averages the samples' values, finer than the codes the attachment \
++                     holds; the resolve averages the codes"
++                        .to_owned(),
+                 )
+             });
+         }
+diff --git a/crates/metal2vulkan-runtime/src/depth_copy.rs b/crates/metal2vulkan-runtime/src/depth_copy.rs
+index ca40777..8e68ed6 100644
+--- a/crates/metal2vulkan-runtime/src/depth_copy.rs
++++ b/crates/metal2vulkan-runtime/src/depth_copy.rs
+@@ -46,21 +46,21 @@
+ //! device; a copy's descriptor set and framebuffer are its own, held by its command buffer until
+ //! it completes.
+ 
++use super::Device;
+ use super::binding_view::VkView;
+ use super::degradation::Degradation;
+ use super::device::{device_error, lock};
+-use super::error::{internal, vulkan, Error};
++use super::error::{Error, internal, vulkan};
+ use super::release;
+ use super::render_pass::Target;
+ use super::sample_planes::{pipeline_layout, set_layout, shader_module};
+-use super::stencil_copy::{aspect_view, draw_framebuffer, record_draws_in, DrawArea, PassObjects};
++use super::stencil_copy::{DrawArea, PassObjects, aspect_view, draw_framebuffer, record_draws_in};
+ use super::texture::image_aspects;
+-use super::Device;
+ use crate::shader_cache::driver::Making;
+ use ash::vk;
+ use metal2vulkan::bind::{
+-    depth_split_module, depth_stencil_copy_modules, DepthSplitModule, DepthStandInForm,
+-    DepthStencilCopy, DepthStencilCopyModules,
++    DepthSplitModule, DepthStandInForm, DepthStencilCopy, DepthStencilCopyModules,
++    depth_split_module, depth_stencil_copy_modules,
+ };
+ use metal2vulkan::cache::Hash256;
+ use metal2vulkan::device::DriverFact;
+@@ -586,7 +586,11 @@ pub(super) fn depth_pass(
+ 
+ /// A bits draw's render pass for a colour image of `format` at `samples`: the image alone,
+ /// `GENERAL` throughout, not loaded (the draw writes every sample of the render area) and stored.
+-fn bits_pass(raw: &ash::Device, format: Format, samples: u32) -> Result<vk::RenderPass, Error> {
++pub(super) fn bits_pass(
++    raw: &ash::Device,
++    format: Format,
++    samples: u32,
++) -> Result<vk::RenderPass, Error> {
+     let general = vk::ImageLayout::GENERAL;
+     let attachments = [vk::AttachmentDescription::default()
+         .format(format.into())
+diff --git a/crates/metal2vulkan-runtime/src/depth_stencil_resolve.rs b/crates/metal2vulkan-runtime/src/depth_stencil_resolve.rs
+index 6fc8d92..60e7e87 100644
+--- a/crates/metal2vulkan-runtime/src/depth_stencil_resolve.rs
++++ b/crates/metal2vulkan-runtime/src/depth_stencil_resolve.rs
+@@ -18,7 +18,9 @@
+ //!   `depth_copy::copies_exactly` holds (a 32-bit float depth, on a driver whose fragment depth
+ //!   stores every value unchanged, `DriverFact::FragmentDepthStoresUnchanged`, or a 16-bit one
+ //!   whose codes it keeps, `DriverFact::FragmentDepthKeepsDepth16Codes`), which
+-//!   `resolve.rs` checks before it picks; elsewhere the device's missing mode stays refused. A
++//!   `resolve.rs` checks before it picks. Other drivers write the selected D32 bits or D16 code
++//!   to an R32_UINT or R16_UINT attachment. A transfer buffer then copies those bytes into the
++//!   destination's depth aspect, preserving the stencil aspect. A
+ //!   picked stencil is the eight bit-plane draws ([`ResolveWrite::StencilPlane`]) over the
+ //!   stencil cleared to 0 over the render area: each survives where its sample's stencil has its
+ //!   bit, which the draw sets under write mask [`StencilBit::mask`], reference 0xFF, compare
+@@ -39,29 +41,34 @@
+ //! command buffer until it completes. The draws run between barriers from everything before and to
+ //! everything after.
+ 
++use super::blit::{TRANSFER, reads, writes};
++use super::buffer::Buffer;
+ use super::device::{device_error, lock};
+ use super::encoder::EncoderCore;
+-use super::error::{internal, vulkan, Error, RuntimeGap};
++use super::error::{Error, RuntimeGap, internal, vulkan};
+ use super::release;
+ use super::render_pass::{PassLayout, Target};
+ use super::resource::ResourceKey;
+ use super::sample_planes::{pipeline_layout, set_layout, shader_module};
+ use super::stencil_copy::{
+-    aspect_view, attachment_use, draw_framebuffer, record_draws, sampled, sampled_use, PassObjects,
+-    DRAW_STAGES,
++    DRAW_STAGES, PassObjects, aspect_view, attachment_use, draw_framebuffer, record_draws, sampled,
++    sampled_use,
+ };
+-use super::texture::image_aspects;
+-use super::tracker::{Barrier, Use};
+-use super::Device;
++use super::texture::{Texture, image_aspects};
++use super::texture_descriptor::TextureDescriptor;
++use super::tracker::{Access, Barrier, Use};
++use super::values::ResourceOptions;
++use super::{Device, IdPlacement};
+ use crate::shader_cache::driver::Making;
+ use ash::vk;
+ use metal2vulkan::bind::{
+-    depth_stencil_resolve_modules, DepthPick, DepthStencilResolveDraw, DepthStencilResolveModules,
+-    ResolveWrite, StencilBit,
++    DepthPick, DepthStencilResolveDraw, DepthStencilResolveModules, ResolveWrite, StencilBit,
++    depth_stencil_resolve_modules,
+ };
+ use metal2vulkan::cache::Hash256;
+ use metal2vulkan::error::Feature;
+-use metal2vulkan::vk::{Format, ImageAspectFlags};
++use metal2vulkan::metal::{PixelFormat, TextureUsage};
++use metal2vulkan::vk::{Format, ImageAspectFlags, ImageUsageFlags};
+ 
+ /// The aspects the draws write (the module docs).
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+@@ -69,6 +76,8 @@ pub(super) enum Drawn {
+     Depth,
+     Stencil,
+     Both,
++    Depth16Bits,
++    Depth32Bits,
+ }
+ 
+ impl Drawn {
+@@ -86,15 +95,25 @@ impl Drawn {
+     }
+ 
+     fn depth(self) -> bool {
+-        self != Drawn::Stencil
++        matches!(self, Drawn::Depth | Drawn::Both)
+     }
+ 
+     fn stencil(self) -> bool {
+-        self != Drawn::Depth
++        matches!(self, Drawn::Stencil | Drawn::Both)
++    }
++
++    fn bits(self) -> bool {
++        matches!(self, Drawn::Depth16Bits | Drawn::Depth32Bits)
+     }
+ 
+     /// The draws, in recording order: the depth's, then each [`StencilBit`]'s plane.
+     pub(super) fn writes(self) -> Vec<ResolveWrite> {
++        if self == Drawn::Depth16Bits {
++            return vec![ResolveWrite::Depth16Bits];
++        }
++        if self == Drawn::Depth32Bits {
++            return vec![ResolveWrite::Depth32Bits];
++        }
+         let depth = self.depth().then_some(ResolveWrite::Depth);
+         let planes = StencilBit::ALL
+             .into_iter()
+@@ -298,9 +317,10 @@ impl Device {
+         };
+         let result = (|| {
+             // The stencil drawn is cleared first; a depth drawn alone keeps the stencil.
+-            made.render_pass = match drawn.stencil() {
+-                true => super::stencil_copy::planes_pass(raw, format, 1)?,
+-                false => super::depth_copy::depth_pass(raw, format, 1)?,
++            made.render_pass = match (drawn.bits(), drawn.stencil()) {
++                (true, _) => super::depth_copy::bits_pass(raw, format, 1)?,
++                (_, true) => super::stencil_copy::planes_pass(raw, format, 1)?,
++                _ => super::depth_copy::depth_pass(raw, format, 1)?,
+             };
+             for (&fragment, write) in shaders.fragments.iter().zip(drawn.writes()) {
+                 let making = Making::new("depth/stencil resolve")
+@@ -366,6 +386,9 @@ fn draw_pipeline(
+     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+     let depth_stencil = match write {
++        ResolveWrite::Depth16Bits | ResolveWrite::Depth32Bits => {
++            vk::PipelineDepthStencilStateCreateInfo::default()
++        }
+         ResolveWrite::Depth => vk::PipelineDepthStencilStateCreateInfo::default()
+             .depth_test_enable(true)
+             .depth_write_enable(true)
+@@ -389,7 +412,14 @@ fn draw_pipeline(
+         }
+         _ => return Err(internal("a resolve draw the runtime does not record")),
+     };
+-    let blend = vk::PipelineColorBlendStateCreateInfo::default();
++    let written = [vk::PipelineColorBlendAttachmentState::default()
++        .blend_enable(false)
++        .color_write_mask(vk::ColorComponentFlags::RGBA)];
++    let blend = if matches!(write, ResolveWrite::Depth16Bits | ResolveWrite::Depth32Bits) {
++        vk::PipelineColorBlendStateCreateInfo::default().attachments(&written)
++    } else {
++        vk::PipelineColorBlendStateCreateInfo::default()
++    };
+     let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+     let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+     let info = vk::GraphicsPipelineCreateInfo::default()
+@@ -440,13 +470,34 @@ pub(super) fn draws_run(
+     if !sampled(source)? {
+         return Err(Error::NotImplemented(RuntimeGap::DepthStencilResolve));
+     }
+-    device
+-        .resolve_draws(pick, drawn, source.samples, into.format)
+-        .map(|_| ())
++    if drawn.depth() && !super::depth_copy::copies_exactly(device, into.format) {
++        let (kind, _, format, _) = depth_bits(into.format)
++            .ok_or(Error::NotImplemented(RuntimeGap::DepthStencilResolve))?;
++        if !into
++            .texture
++            .image_plan()?
++            .usage
++            .contains(ImageUsageFlags::TRANSFER_DST)
++        {
++            return Err(Error::NotImplemented(RuntimeGap::DepthStencilResolve));
++        }
++        device.resolve_draws(pick, kind, source.samples, format)?;
++        if drawn.stencil() {
++            device.resolve_draws(pick, Drawn::Stencil, source.samples, into.format)?;
++        }
++    } else {
++        device.resolve_draws(pick, drawn, source.samples, into.format)?;
++    }
++    Ok(())
+ }
+ 
+ /// A pass's drawn depth/stencil resolve, planned before the pass records and recorded after it.
+ pub(super) struct DrawnResolve {
++    draws: Vec<ResolveDraw>,
++}
++
++/// ResolveDraw owns one attachment draw and the optional transfer of its integer depth codes.
++struct ResolveDraw {
+     objects: PassObjects,
+     shaders: Shaders,
+     made: Pipelines,
+@@ -454,6 +505,42 @@ pub(super) struct DrawnResolve {
+     /// The render area, from the origin.
+     area: [u32; 2],
+     uses: Vec<Use<ResourceKey>>,
++    bits: Option<DepthBitsCopy>,
++}
++
++/// DepthBitsCopy retains the integer image and transfer buffer until the resolved depth is written.
++struct DepthBitsCopy {
++    texture: Texture,
++    destination: Target,
++    staging: Buffer,
++    bytes: u64,
++    source_image: vk::Image,
++    destination_image: vk::Image,
++    read_image: Use<ResourceKey>,
++    write_image: Use<ResourceKey>,
++}
++
++fn depth_bits(format: Format) -> Option<(Drawn, PixelFormat, Format, u64)> {
++    match format {
++        Format::D16_UNORM | Format::D16_UNORM_S8_UINT => Some((
++            Drawn::Depth16Bits,
++            PixelFormat::R16Uint,
++            Format::R16_UINT,
++            2,
++        )),
++        Format::D32_SFLOAT | Format::D32_SFLOAT_S8_UINT => Some((
++            Drawn::Depth32Bits,
++            PixelFormat::R32Uint,
++            Format::R32_UINT,
++            4,
++        )),
++        _ => None,
++    }
++}
++
++/// A depth resolve can preserve the selected code through an integer attachment and transfer buffer.
++pub(super) fn can_copy_depth_bits(format: Format) -> bool {
++    depth_bits(format).is_some()
+ }
+ 
+ impl DrawnResolve {
+@@ -473,61 +560,236 @@ impl DrawnResolve {
+         let Some((pick, aspects)) = resolve.picked() else {
+             return Ok(None);
+         };
+-        let into = &resolve
+-            .drawn_target()
+-            .ok_or_else(|| internal("a drawn resolve without its attachment"))?
+-            .attachment;
+         let source = &ds.target;
+-        draws_run(device, source, into, pick, aspects)?;
+-        let drawn = Drawn::of(aspects).ok_or_else(|| internal("a drawn resolve of no aspect"))?;
++        let mut draws = Vec::new();
++        for (target, target_aspects) in resolve.drawn_targets() {
++            let into = &target.attachment;
++            let aspects = aspects & target_aspects;
++            draws_run(device, source, into, pick, aspects)?;
++            let mut remaining = aspects;
++            if aspects.contains(ImageAspectFlags::DEPTH)
++                && !super::depth_copy::copies_exactly(device, into.format)
++            {
++                let (kind, pixel_format, format, bytes_per_texel) = depth_bits(into.format)
++                    .ok_or(Error::NotImplemented(RuntimeGap::DepthStencilResolve))?;
++                let [width, height] = layout.extent;
++                let texture = device.new_texture(&TextureDescriptor {
++                    pixel_format,
++                    width: u64::from(width),
++                    height: u64::from(height),
++                    usage: TextureUsage::RENDER_TARGET,
++                    resource_options: ResourceOptions::private(),
++                    placement: IdPlacement::Outside,
++                    ..TextureDescriptor::default()
++                })?;
++                let integer_target = Target {
++                    texture: texture.clone(),
++                    level: 0,
++                    layer: 0,
++                    layers: 1,
++                    format,
++                    samples: 1,
++                    extent: layout.extent,
++                };
++                let bytes = u64::from(width) * u64::from(height) * bytes_per_texel;
++                let bits = DepthBitsCopy {
++                    source_image: texture.raw_image()?,
++                    destination_image: into.texture.raw_image()?,
++                    read_image: texture.image_use(
++                        0..1,
++                        0..1,
++                        Access::new(TRANSFER, vk::AccessFlags2::TRANSFER_READ),
++                        false,
++                    )?,
++                    write_image: into.texture.image_use(
++                        into.level..into.level + 1,
++                        into.layer..into.layer + 1,
++                        Access::new(TRANSFER, vk::AccessFlags2::TRANSFER_WRITE),
++                        true,
++                    )?,
++                    texture,
++                    destination: into.clone(),
++                    staging: device.own_buffer(bytes, ResourceOptions::private())?,
++                    bytes,
++                };
++                draws.push(ResolveDraw::plan(
++                    device,
++                    source,
++                    &integer_target,
++                    pick,
++                    kind,
++                    layout.extent,
++                    Some(bits),
++                )?);
++                remaining = remaining.difference(ImageAspectFlags::DEPTH);
++            }
++            if let Some(drawn) = Drawn::of(remaining) {
++                draws.push(ResolveDraw::plan(
++                    device,
++                    source,
++                    into,
++                    pick,
++                    drawn,
++                    layout.extent,
++                    None,
++                )?);
++            }
++        }
++        Ok(Some(DrawnResolve { draws }))
++    }
++
++    pub(super) fn record(self, core: &mut EncoderCore) {
++        for draw in self.draws {
++            draw.record(core);
++        }
++    }
++}
++
++impl ResolveDraw {
++    fn plan(
++        device: &Device,
++        source: &Target,
++        into: &Target,
++        pick: DepthPick,
++        drawn: Drawn,
++        area: [u32; 2],
++        bits: Option<DepthBitsCopy>,
++    ) -> Result<Self, Error> {
+         let (shaders, made) = device.resolve_draws(pick, drawn, source.samples, into.format)?;
+         let mut views = vec![(SET[0], aspect_view(source, ImageAspectFlags::DEPTH)?)];
+         if drawn.stencil() {
+             views.push((SET[1], aspect_view(source, ImageAspectFlags::STENCIL)?));
+         }
+         let (mut objects, set) = PassObjects::with_set(device, shaders.set_layout, &views)?;
+-        draw_framebuffer(&mut objects, made.render_pass, into, layout.extent)?;
+-        Ok(Some(DrawnResolve {
++        draw_framebuffer(&mut objects, made.render_pass, into, area)?;
++        let written = if drawn.bits() {
++            into.texture.image_use(
++                0..1,
++                0..1,
++                Access::new(
++                    vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
++                    vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
++                ),
++                true,
++            )?
++        } else {
++            attachment_use(into)?
++        };
++        Ok(ResolveDraw {
+             objects,
+             shaders,
+             made,
+             set,
+-            area: layout.extent,
+-            uses: vec![sampled_use(source)?, attachment_use(into)?],
+-        }))
++            area,
++            uses: vec![sampled_use(source)?, written],
++            bits,
++        })
+     }
+ 
+     /// Record the draws in `core`'s command buffer after the pass, between barriers from
+     /// everything before and to everything after, and hold their objects until the command
+     /// buffer completes.
+     pub(super) fn record(self, core: &mut EncoderCore) {
+-        let DrawnResolve {
++        let ResolveDraw {
+             objects,
+             shaders,
+             made,
+             set,
+             area,
+             uses,
++            bits,
+         } = self;
+         let framebuffer = objects.framebuffer;
+         core.barrier(Barrier::everything());
+-        core.command(DRAW_STAGES, &uses, |device, raw| {
+-            // SAFETY: the encoder's command buffer is recording outside a render pass; the
+-            // pipelines, framebuffer, set and the images they view are live until it completes
+-            // (the device keeps the pipelines, these objects the framebuffer and set, the encoder
+-            // the textures); every image rests in `GENERAL`.
++        core.command(
++            DRAW_STAGES | vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
++            &uses,
++            |device, raw| {
++                // SAFETY: the encoder's command buffer is recording outside a render pass; the
++                // pipelines, framebuffer, set and the images they view are live until it completes
++                // (the device keeps the pipelines, these objects the framebuffer and set, the encoder
++                // the textures); every image rests in `GENERAL`.
++                unsafe {
++                    record_draws(
++                        device,
++                        raw,
++                        (made.render_pass, framebuffer),
++                        (shaders.layout, set),
++                        &made.pipelines,
++                        area,
++                    );
++                }
++            },
++        );
++        core.barrier(Barrier::everything());
++        core.retain(objects);
++        if let Some(bits) = bits {
++            bits.record(core, area);
++        }
++    }
++}
++
++impl DepthBitsCopy {
++    fn record(self, core: &mut EncoderCore, [width, height]: [u32; 2]) {
++        let from = self.source_image;
++        let to = self.destination_image;
++        let (buffer, offset) = self.staging.at(0);
++        let region = vk::BufferImageCopy {
++            buffer_offset: offset,
++            buffer_row_length: 0,
++            buffer_image_height: 0,
++            image_subresource: vk::ImageSubresourceLayers {
++                aspect_mask: vk::ImageAspectFlags::COLOR,
++                mip_level: 0,
++                base_array_layer: 0,
++                layer_count: 1,
++            },
++            image_offset: vk::Offset3D::default(),
++            image_extent: vk::Extent3D {
++                width,
++                height,
++                depth: 1,
++            },
++        };
++        let output = vk::BufferImageCopy {
++            image_subresource: vk::ImageSubresourceLayers {
++                aspect_mask: vk::ImageAspectFlags::DEPTH,
++                mip_level: self.destination.level,
++                base_array_layer: self.destination.layer,
++                layer_count: 1,
++            },
++            ..region
++        };
++        let read = [self.read_image, writes(&self.staging, 0..self.bytes)];
++        core.command(TRANSFER, &read, |device, raw| {
++            // SAFETY: the image and buffer cover the complete render area and remain retained.
++            unsafe {
++                device.cmd_copy_image_to_buffer(
++                    raw,
++                    from,
++                    vk::ImageLayout::GENERAL,
++                    buffer,
++                    &[region],
++                );
++            }
++        });
++        core.barrier(Barrier::everything());
++        let write = [reads(&self.staging, 0..self.bytes), self.write_image];
++        core.command(TRANSFER, &write, |device, raw| {
++            // SAFETY: the transfer writes the target's depth aspect at its selected level and layer.
+             unsafe {
+-                record_draws(
+-                    device,
++                device.cmd_copy_buffer_to_image(
+                     raw,
+-                    (made.render_pass, framebuffer),
+-                    (shaders.layout, set),
+-                    &made.pipelines,
+-                    area,
++                    buffer,
++                    to,
++                    vk::ImageLayout::GENERAL,
++                    &[output],
+                 );
+             }
+         });
+         core.barrier(Barrier::everything());
+-        core.retain(objects);
++        core.retain(self.texture);
++        core.retain(self.destination.texture);
++        core.retain(self.staging);
+     }
+ }
+diff --git a/crates/metal2vulkan-runtime/src/families/features.rs b/crates/metal2vulkan-runtime/src/families/features.rs
+index b63c88d..bbcbacd 100644
+--- a/crates/metal2vulkan-runtime/src/families/features.rs
++++ b/crates/metal2vulkan-runtime/src/families/features.rs
+@@ -850,7 +850,7 @@ impl FeatureRow {
+     /// The row's state on a device of `f`, for a family read from `column` (the module docs).
+     pub(super) fn state(self, column: Column, f: &Facts<'_>) -> RowState {
+         use FeatureRow as F;
+-        use FormatCapability::{Atomic, Filter};
++        use FormatCapability::{Atomic, Color, Filter};
+         use RuntimeGap as G;
+         let d = &f.properties.description;
+         match self {
+@@ -1009,20 +1009,32 @@ impl FeatureRow {
+                     Capability::Feature(VkFeature::RasterizationOrderColorAttachmentAccess),
+                 ))
+             })]),
+-            // Separate depth and stencil textures of one pass: their resolve of a stencil drawn
+-            // after the pass (`DepthResolvedSample` after `Min` or `Max`) is not built.
++            // Separate textures resolve each picked aspect independently. Multisampled loads
++            // and stores still require exact depth copies between the separate and combined images.
+             F::SeparateDepthStencilAttachments => first([gap(G::DepthStencilResolve)]),
+-            // `MultisampleDepthResolveFilter` `Min` and `Max`: the device's
+-            // `supportedDepthResolveModes`.
+-            F::MsaaDepthResolve => first([(!d
+-                .limits
+-                .supported_depth_resolve_modes
+-                .contains(ResolveModeFlags::MIN.union(ResolveModeFlags::MAX)))
+-            .then_some(RowState::Gap(G::DepthStencilResolve))]),
++            // Min/Max uses the device's mode or writes the selected depth code to an integer
++            // color attachment and transfers it into the single-sampled depth aspect.
++            F::MsaaDepthResolve => {
++                if d.limits
++                    .supported_depth_resolve_modes
++                    .contains(ResolveModeFlags::MIN.union(ResolveModeFlags::MAX))
++                {
++                    RowState::Exact
++                } else {
++                    first([
++                        formats(f, &[FormatRow::R16Uint, FormatRow::R32Uint], Color),
++                        formats(
++                            f,
++                            &[FormatRow::Depth16Unorm, FormatRow::Depth32Float],
++                            Filter,
++                        ),
++                    ])
++                }
++            }
+             // `MultisampleStencilResolveFilter::DepthResolvedSample` after a `Min` or `Max` depth
+             // resolve: no Vulkan resolve mode states it. The runtime draws it after the pass
+-            // (`depth_stencil_resolve.rs`) for a pass of one layer whose attachment is sampled, but
+-            // still refuses a layered pass and an attachment it cannot sample.
++            // (`depth_stencil_resolve.rs`) from a sampled attachment, including separate resolve
++            // targets. An attachment the device cannot sample still needs a separate copy path.
+             F::StencilResolve => first([gap(G::DepthStencilResolve)]),
+             // `StoreAction::StoreAndMultisampleResolve`, memoryless render targets, and the store
+             // actions set after a pass's draws (`set_*_store_action`).
+@@ -1153,15 +1165,14 @@ impl FeatureRow {
+             F::TextureBarriers | F::VisibilityCountAccumulation | F::DepthBoundsTesting => {
+                 first([gap(G::Render)])
+             }
+-            // Patch draws: `tessellationShader`; the runtime's patch draws, direct and indirect,
+-            // are built (`tessellation.rs`). The compile layer still refuses a post-tessellation
+-            // vertex function whose patch states no control-point count (`[[patch(kind)]]`), and
+-            // a fragment function behind one that reads `[[primitive_id]]`
+-            // (`NotImplemented(Tessellation)`).
+-            F::Tessellation | F::IndirectTessellationArguments => first([
+-                needs_features(f, Feature::Tessellation, &[VkFeature::TessellationShader]),
+-                not_implemented(Feature::Tessellation),
+-            ]),
++            // Direct and indirect patch draws include the default control-point count,
++            // per-instance factors and the fragment primitive ID. The Apple3 tessellation row
++            // requires the tessellator; SIMD operations retain their separate row requirements.
++            F::Tessellation | F::IndirectTessellationArguments => first([needs_features(
++                f,
++                Feature::Tessellation,
++                &[VkFeature::TessellationShader],
++            )]),
+             // Coverage after the depth test (`[[post_depth_coverage]]`): not lowered.
+             F::PostDepthCoverage => {
+                 first([not_implemented(Feature::Lowering(LowerFamily::Fragment))])
+diff --git a/crates/metal2vulkan-runtime/src/image_plan.rs b/crates/metal2vulkan-runtime/src/image_plan.rs
+index dc67ef8..096485f 100644
+--- a/crates/metal2vulkan-runtime/src/image_plan.rs
++++ b/crates/metal2vulkan-runtime/src/image_plan.rs
+@@ -31,7 +31,9 @@
+ //!   image that is not square).
+ //! - **Memoryless.** A memoryless texture is a transient attachment (a color one an input
+ //!   attachment too, as above) and nothing else, of any texture type (a 3D one 2D-array
+-//!   compatible, as a stored 3D render target).
++//!   compatible, as a stored 3D render target). Multisampled depth/stencil images use private
++//!   device memory and sampled usage so a resolve draw can read the pass's samples. Their Metal
++//!   storage mode and prohibition on preserving contents between passes remain memoryless.
+ //! - **Sample positions.** A multisampled depth or depth/stencil render target is made
+ //!   `SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_EXT` where the device takes custom sample positions at its
+ //!   count, so a pass with sample positions may attach it (`sample_positions::compatible_depth`).
+@@ -63,7 +65,7 @@ use super::pvrtc::plan_blocks;
+ use super::sample_positions::compatible_depth;
+ use super::sharing::Sharing;
+ use super::texture::heap_tiled::metal_keeps_uncompressed;
+-use super::texture_descriptor::{effective_usage, TextureLayout};
++use super::texture_descriptor::{TextureLayout, effective_usage};
+ use super::values::StorageMode;
+ use ash::vk;
+ use metal2vulkan::device::{
+@@ -74,8 +76,8 @@ use metal2vulkan::error::{
+     Capability, Error as CompileError, Feature, Needs, RuntimeDriverDefect, Unsupported,
+ };
+ use metal2vulkan::metal::format::{
+-    direct_format, image_type, is_depth_stencil, srgb_raw_twin, storage_image_choice,
+-    storage_view_formats, vk_format, FormatEmulation, FormatMapping,
++    FormatEmulation, FormatMapping, direct_format, image_type, is_depth_stencil, srgb_raw_twin,
++    storage_image_choice, storage_view_formats, vk_format,
+ };
+ use metal2vulkan::metal::{PixelFormat, TextureType, TextureUsage};
+ use metal2vulkan::vk::{
+@@ -339,7 +341,10 @@ impl ImagePlan {
+             .flags
+             .contains(ImageCreateFlags::CREATE_2D_ARRAY_COMPATIBLE)
+             && defects.contains(&RuntimeDriverDefect::LazilyAllocatedVolumePlaneViews);
+-        if storage == StorageMode::Memoryless && !plane_views {
++        if storage == StorageMode::Memoryless
++            && !plane_views
++            && self.usage.contains(ImageUsageFlags::TRANSIENT_ATTACHMENT)
++        {
+             MemoryClass::Memoryless
+         } else {
+             MemoryClass::Private
+@@ -640,6 +645,15 @@ fn plan_held(
+         if layout.texture_type == TextureType::Type3D && !depth_stencil {
+             flags |= render_3d_flags(profile);
+         }
++        let mut image_usage =
++            attachment_flag(depth_stencil, profile) | ImageUsageFlags::TRANSIENT_ATTACHMENT;
++        if depth_stencil
++            && layout.samples > 1
++            && profile.supports_format(direct, FormatUsage::SampledImage)
++        {
++            image_usage = image_usage.difference(ImageUsageFlags::TRANSIENT_ATTACHMENT);
++            image_usage |= ImageUsageFlags::SAMPLED;
++        }
+         return Ok(ImagePlan {
+             pixel_format: pf,
+             flags,
+@@ -649,7 +663,7 @@ fn plan_held(
+             levels: layout.levels,
+             layers: layout.layers,
+             samples,
+-            usage: attachment_flag(depth_stencil, profile) | ImageUsageFlags::TRANSIENT_ATTACHMENT,
++            usage: image_usage,
+             view_formats: Vec::new(),
+             mapping,
+             // A memoryless texture is a render target only.
+@@ -777,6 +791,10 @@ fn plan_held(
+             // where the device takes them (`sample_positions::compatible_depth`).
+             if depth_stencil {
+                 flags |= compatible_depth(profile, format, samples);
++                if layout.samples > 1 && profile.supports_format(format, FormatUsage::SampledImage)
++                {
++                    usage_flags |= ImageUsageFlags::SAMPLED;
++                }
+             }
+         } else {
+             unavailable |= usage.intersection(TextureUsage::RENDER_TARGET);
+diff --git a/crates/metal2vulkan-runtime/src/resolve.rs b/crates/metal2vulkan-runtime/src/resolve.rs
+index 287e531..8061a6f 100644
+--- a/crates/metal2vulkan-runtime/src/resolve.rs
++++ b/crates/metal2vulkan-runtime/src/resolve.rs
+@@ -123,8 +123,8 @@
+ //!   `DriverFact::FragmentDepthStoresUnchanged`, or a 16-bit one, whose code is kept where
+ //!   `DriverFact::FragmentDepthKeepsDepth16Codes` holds); its stencil then too after
+ //!   `DepthResolvedSample`. Where the subpass resolves no aspect, the draws write the resolve
+-//!   texture (or a scratch image copied there) themselves. Elsewhere the missing mode stays
+-//!   refused, `NotImplemented(DepthStencilResolve)`.
++//!   texture (or a scratch image copied there) themselves. Other drivers resolve D16 and D32
++//!   through an integer color attachment and transfer buffer, retaining the selected depth code.
+ //! - A resolve texture whose image cannot be an attachment (Metal's texture has no
+ //!   `RenderTarget` usage) is resolved into a scratch image of the pass, whose render area is
+ //!   copied into the texture after the pass.
+@@ -153,8 +153,7 @@
+ //! device's description states them (`VkProperty::{DepthResolveMode, StencilResolveMode,
+ //! IndependentResolveNone, IndependentResolve}`), for which a resolve draw is the exact path; and
+ //! `DepthResolvedSample` after `Min` or `Max` of an attachment whose image is not sampled, or
+-//! whose stencil the draws cannot write; and a split resolve (below) with an aspect drawn after
+-//! the pass.
++//! whose stencil the draws cannot write.
+ //!
+ //! **Split resolves**. Where the aspects resolve into different textures (separate depth and
+ //! stencil textures, which render through a combined scratch image, `depth_stencil_scratch.rs`, or
+@@ -162,34 +161,35 @@
+ //! is checked against the attachment that names it, and each aspect resolves in a subpass of its
+ //! own (the first in the draws' subpass, the second in a later pass) into a scratch image of the
+ //! attachment's format, whose aspect alone is copied into its texture after the pass through a
+-//! staging buffer, as one aspect at a time does. An aspect the pass does not resolve keeps its
++//! staging buffer, as one aspect at a time does. A picked aspect receives a separate scratch
++//! attachment and resolve draw before the copy. An aspect the pass does not resolve keeps its
+ //! resolve texture's texels. Announced as `one-aspect-resolve`.
+ 
+-use super::blit::{reads, writes, TRANSFER};
++use super::Device;
++use super::blit::{TRANSFER, reads, writes};
+ use super::buffer::Buffer;
+ use super::color_resolve;
+ use super::command_buffer::CommandBuffer;
+ use super::degradation::Degradation;
+ use super::depth_stencil_scratch::Separate;
+ use super::encoder::EncoderCore;
+-use super::error::{internal, invalid, Error, Problem, RuntimeGap};
+-use super::image_plan::{block_family, sample_count, srgb_twin, ImagePlan};
++use super::error::{Error, Problem, RuntimeGap, internal, invalid};
++use super::image_plan::{ImagePlan, block_family, sample_count, srgb_twin};
+ use super::linear_attachment;
+ use super::render_pass::{Attachment, Facts, PassLayout, RenderPassProblem, Target};
+ use super::render_values::{
+     LoadAction, MultisampleDepthResolveFilter, MultisampleStencilResolveFilter, StoreAction,
+ };
+ use super::resource::ResourceKey;
+-use super::texture::{copy_units, image_aspects, Texture};
++use super::texture::{Texture, copy_units, image_aspects};
+ use super::texture_descriptor::TextureDescriptor;
+ use super::tracker::{Access, Barrier, Use};
+ use super::values::{ResourceOptions, StorageMode};
+-use super::Device;
+ use ash::vk;
+ use metal2vulkan::bind::{ColorResolveFormat, DepthPick};
+ use metal2vulkan::device::DeviceProfile;
+ use metal2vulkan::error::{Feature, RuntimeDriverDefect, Unsupported};
+-use metal2vulkan::metal::format::{aspects, sampled_type, ExtendedRange, FormatMapping};
++use metal2vulkan::metal::format::{ExtendedRange, FormatMapping, aspects, sampled_type};
+ use metal2vulkan::metal::{PixelFormat, TextureType, TextureUsage};
+ use metal2vulkan::pipeline::SampledType;
+ use metal2vulkan::vk::{ImageAspectFlags, ImageCreateFlags, ImageType, ImageUsageFlags};
+@@ -304,7 +304,7 @@ pub(super) struct DepthStencilResolve {
+     pub(super) steps: Vec<ResolveStep>,
+     /// The resolve attachment the draws write where no step resolves into one (every resolved
+     /// aspect drawn): the resolve texture's level and slice, or a scratch image copied there.
+-    pub(super) drawn_into: Option<Resolve>,
++    pub(super) drawn_into: Vec<(Resolve, ImageAspectFlags)>,
+     /// Its aspects resolve into different textures (separate ones, or two for one combined
+     /// texture): each step resolves one aspect into a scratch image copied into its own.
+     pub(super) split: bool,
+@@ -318,21 +318,28 @@ impl DepthStencilResolve {
+ 
+     /// The resolve attachment the drawn aspects are written into: the first step's, or the
+     /// draws' own.
+-    pub(super) fn drawn_target(&self) -> Option<&Resolve> {
+-        self.steps
++    pub(super) fn drawn_targets(&self) -> impl Iterator<Item = (&Resolve, ImageAspectFlags)> {
++        let shared = self
++            .steps
+             .first()
+-            .map(|step| &step.resolve)
+-            .or(self.drawn_into.as_ref())
++            .filter(|_| !self.split)
++            .and_then(|step| self.picked().map(|(_, aspects)| (&step.resolve, aspects)));
++        shared.into_iter().chain(
++            self.drawn_into
++                .iter()
++                .map(|(resolve, aspects)| (resolve, *aspects)),
++        )
+     }
+ 
+     /// Each resolve attachment it writes, with the aspects of the resolve texture written there
+     /// (those a scratch image's copy takes): its steps', then the draws' own.
+     pub(super) fn written(&self) -> impl Iterator<Item = (&Resolve, ImageAspectFlags)> {
+-        let drawn = self
+-            .picked()
+-            .map_or(ImageAspectFlags::empty(), |(_, aspects)| aspects);
+         let steps = self.steps.iter().map(|step| (&step.resolve, step.aspects));
+-        steps.chain(self.drawn_into.iter().map(move |resolve| (resolve, drawn)))
++        steps.chain(
++            self.drawn_into
++                .iter()
++                .map(|(resolve, aspects)| (resolve, *aspects)),
++        )
+     }
+ }
+ 
+@@ -379,12 +386,10 @@ impl<'a> Wanted<'a> {
+     }
+ }
+ 
+-/// The refusal of a resolve from or into a texture of `pf` that the runtime does not model: an
+-/// extended-range format's, whose resolve in Metal matches no average of its samples' values
+-/// measured (EV XRR-rtp1-m4). The format's Resolve capability answers it too
+-/// (`families::formats`).
++/// The refusal for an XR format without a legal multisample texture and shader resolve rule.
+ pub(crate) fn unmodelled_resolve(pf: PixelFormat) -> Option<Unsupported> {
+-    ExtendedRange::of(pf).map(|_| Unsupported::not_implemented(Feature::Format))
++    (ExtendedRange::of(pf).is_some() && color_resolve::extended(pf).is_none())
++        .then(|| Unsupported::not_implemented(Feature::Format))
+ }
+ 
+ fn problem(call: &'static str, p: RenderPassProblem) -> Error {
+@@ -578,10 +583,11 @@ pub(super) fn depth_stencil(
+         .or_else(|| stencil_destination.clone())
+         .ok_or_else(|| internal("a depth/stencil resolve without its attachment"))?;
+     let modes = ResolveModes::of(device.compile_device().profile());
+-    // A `Min` or `Max` depth the device has no mode for is drawn after the pass where its
+-    // fragment depth stores the picked value unchanged (`depth_copy::copies_exactly`).
+-    let exact_depth = super::depth_copy::copies_exactly(device, source.format)
+-        && super::depth_copy::copies_exactly(device, destination.target.format);
++    // A missing Min/Max mode uses a resolve draw. D16 and D32 can pass through an integer
++    // attachment and transfer buffer when fragment-depth output would change stored values.
++    let exact_depth = (super::depth_copy::copies_exactly(device, source.format)
++        && super::depth_copy::copies_exactly(device, destination.target.format))
++        || super::depth_stencil_resolve::can_copy_depth_bits(destination.target.format);
+     let pick_or = |mode: ResolveMode, pick: DepthPick| match exact_depth
+         && !modes.depth.contains(mode.vk())
+     {
+@@ -629,23 +635,19 @@ pub(super) fn depth_stencil(
+     // Every resolved aspect drawn: no subpass resolves, and the draws write their own resolve
+     // attachment.
+     let (mut steps, drawn_into) = if split {
+-        // A split resolve resolves each aspect into a scratch image of `source` in a subpass of
+-        // its own, and copies that aspect alone into its texture after the pass. An aspect drawn
+-        // after the pass writes the first step's attachment, which a split resolve does not
+-        // copy whole: not built.
+-        if picked(depth_mode, stencil_mode).is_some() {
+-            return Err(Error::NotImplemented(RuntimeGap::DepthStencilResolve));
+-        }
+         let aspects = [
+             (depth_mode, ImageAspectFlags::DEPTH, depth_destination),
+             (stencil_mode, ImageAspectFlags::STENCIL, stencil_destination),
+         ];
+-        (split_steps(maker, source, aspects, &modes)?, None)
++        split_steps(maker, source, aspects, &modes)?
+     } else if subpass_depth == none && subpass_stencil == none {
+-        let usage = ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
++        let usage = ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | ImageUsageFlags::TRANSFER_DST;
++        let aspects = picked(depth_mode, stencil_mode)
++            .map(|(_, aspects)| aspects)
++            .ok_or_else(|| internal("a resolve without a subpass or drawn aspect"))?;
+         (
+             Vec::new(),
+-            Some(destination.attach(maker, source, usage, false)?),
++            vec![(destination.attach(maker, source, usage, false)?, aspects)],
+         )
+     } else {
+         let steps = steps(
+@@ -656,11 +658,12 @@ pub(super) fn depth_stencil(
+             subpass_stencil,
+             &modes,
+         )?;
+-        (steps, None)
++        (steps, Vec::new())
+     };
+     // A drawn aspect is written into the first step's resolve attachment, which then holds it
+     // too (a scratch image's copy takes it), or into the draws' own.
+-    if let (Some((_, aspects)), Some(step)) = (picked(depth_mode, stencil_mode), steps.first_mut())
++    if let (false, Some((_, aspects)), Some(step)) =
++        (split, picked(depth_mode, stencil_mode), steps.first_mut())
+     {
+         step.aspects |= aspects;
+     }
+@@ -671,11 +674,16 @@ pub(super) fn depth_stencil(
+         drawn_into,
+         split,
+     };
+-    if let Some((pick, aspects)) = resolve.picked() {
+-        let into = resolve
+-            .drawn_target()
+-            .ok_or_else(|| internal("a drawn resolve without its attachment"))?;
+-        super::depth_stencil_resolve::draws_run(device, source, &into.attachment, pick, aspects)?;
++    if let Some((pick, _)) = resolve.picked() {
++        for (into, aspects) in resolve.drawn_targets() {
++            super::depth_stencil_resolve::draws_run(
++                device,
++                source,
++                &into.attachment,
++                pick,
++                aspects,
++            )?;
++        }
+     }
+     Ok(Some(resolve))
+ }
+@@ -779,11 +787,12 @@ fn split_steps(
+     source: &Target,
+     aspects: [(ResolveMode, ImageAspectFlags, Option<Destination>); 2],
+     modes: &ResolveModes,
+-) -> Result<Vec<ResolveStep>, Error> {
++) -> Result<(Vec<ResolveStep>, Vec<(Resolve, ImageAspectFlags)>), Error> {
+     let none = ResolveMode::None;
+     let both =
+         image_aspects(source.format).contains(ImageAspectFlags::DEPTH | ImageAspectFlags::STENCIL);
+     let mut steps = Vec::new();
++    let mut drawn = Vec::new();
+     for (mode, aspect, destination) in aspects {
+         if mode == none {
+             continue;
+@@ -795,6 +804,23 @@ fn split_steps(
+         {
+             return Err(Error::NotImplemented(RuntimeGap::DepthStencilResolve));
+         }
++        if matches!(mode, ResolveMode::Picked(_)) {
++            drawn.push((
++                Resolve {
++                    attachment: scratch(
++                        maker,
++                        source,
++                        ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | ImageUsageFlags::TRANSFER_DST,
++                        1,
++                    )?,
++                    copy_to: Some(destination.target),
++                    shader: None,
++                    clear: None,
++                },
++                aspect,
++            ));
++            continue;
++        }
+         let pair = |other| {
+             if aspect == ImageAspectFlags::DEPTH {
+                 (mode, other)
+@@ -819,7 +845,7 @@ fn split_steps(
+             one_aspect: true,
+         });
+     }
+-    Ok(steps)
++    Ok((steps, drawn))
+ }
+ 
+ /// A resolve texture's level and slice, with its image's usage.
+@@ -1113,7 +1139,7 @@ fn other_channel_order(a: PixelFormat, b: PixelFormat) -> bool {
+ /// An image of `source`'s format, extent and layers, of `samples`, that the pass resolves into,
+ /// then copies from (one sample), or that a copy of `source` is resolved from (its samples,
+ /// [`ResolveSource`]).
+-fn scratch(
++pub(super) fn scratch(
+     maker: &CommandBuffer,
+     source: &Target,
+     usage: ImageUsageFlags,
+@@ -1150,7 +1176,7 @@ fn scratch(
+         layers,
+         samples: sample_count(samples)
+             .ok_or_else(|| internal("an attachment of a sample count Vulkan lacks"))?,
+-        usage: usage | ImageUsageFlags::TRANSFER_SRC,
++        usage: usage | ImageUsageFlags::TRANSFER_SRC | ImageUsageFlags::TRANSFER_DST,
+         view_formats: Vec::new(),
+         mapping: FormatMapping::direct(format, aspects),
+         unavailable: TextureUsage::SHADER_READ
+diff --git a/crates/metal2vulkan/src/bind/depth_stencil_resolve.rs b/crates/metal2vulkan/src/bind/depth_stencil_resolve.rs
+index cdf74cc..3040196 100644
+--- a/crates/metal2vulkan/src/bind/depth_stencil_resolve.rs
++++ b/crates/metal2vulkan/src/bind/depth_stencil_resolve.rs
+@@ -37,9 +37,9 @@
+ 
+ use std::sync::Arc;
+ 
+-use super::depth_stencil_copy::{finish, multisampled_image, u32_ty, uint, StencilBit};
+-use crate::device::requirements::Requirements;
++use super::depth_stencil_copy::{StencilBit, finish, multisampled_image, u32_ty, uint};
+ use crate::device::Device;
++use crate::device::requirements::Requirements;
+ use crate::error::{Error, Feature, InternalError, InternalKind};
+ use crate::pipeline::sym::{ResourceKind, ResourceSlot, Stage};
+ use crate::spirv::builder::constructs::{ArmEnd, ArmFn, KillForm};
+@@ -47,8 +47,8 @@ use crate::spirv::builder::{FunctionBuilder, ModuleBuilder};
+ use crate::spirv::error::{BResult, BuildError, OperandRule};
+ use crate::spirv::ids::Value;
+ use crate::spirv::ir::{
+-    BinOp, ConvOp, ExecMode, ExecModel, ImageOperands, ImageUsage, IoDir, MemAccess, StorageClass,
+-    Type, TypedModule,
++    BinOp, ConstBits, Constant, ConvOp, ExecMode, ExecModel, ImageOperands, ImageUsage, IoDir,
++    MemAccess, StorageClass, Type, TypedModule,
+ };
+ 
+ /// Which sample of each pixel a resolve draw takes (the module docs).
+@@ -67,6 +67,10 @@ pub enum DepthPick {
+ pub enum ResolveWrite {
+     /// The sample's depth, as `FragDepth`.
+     Depth,
++    /// The sample's float depth bits in the red unsigned integer color output.
++    Depth32Bits,
++    /// The sample's normalized 16-bit depth code in the red unsigned integer color output.
++    Depth16Bits,
+     /// The sample's stencil, as `FragStencilRefEXT` (`VK_EXT_shader_stencil_export`).
+     StencilExport,
+     /// One bit plane of the sample's stencil: the invocation is killed where its bit is clear.
+@@ -76,7 +80,10 @@ pub enum ResolveWrite {
+ impl ResolveWrite {
+     /// Whether the draw reads the stencil aspect.
+     pub fn reads_stencil(self) -> bool {
+-        !matches!(self, ResolveWrite::Depth)
++        !matches!(
++            self,
++            ResolveWrite::Depth | ResolveWrite::Depth32Bits | ResolveWrite::Depth16Bits
++        )
+     }
+ }
+ 
+@@ -241,6 +248,31 @@ pub fn fragment_typed_module(draw: DepthStencilResolveDraw) -> BResult<TypedModu
+             let output = f.module().global_value(output)?;
+             f.store(output, depth, MemAccess::default())?;
+         }
++        (ResolveWrite::Depth32Bits | ResolveWrite::Depth16Bits, _) => {
++            let bits = if draw.write == ResolveWrite::Depth32Bits {
++                f.convert(ConvOp::Bitcast, depth, u32_)?
++            } else {
++                let scale = f.module().constant(Constant::Scalar {
++                    ty: f32_,
++                    bits: ConstBits(u64::from(65535.0f32.to_bits())),
++                })?;
++                let scale = f.module().const_value(scale)?;
++                let half = f.module().constant(Constant::Scalar {
++                    ty: f32_,
++                    bits: ConstBits(u64::from(0.5f32.to_bits())),
++                })?;
++                let half = f.module().const_value(half)?;
++                let code = f.binary(BinOp::FMul, depth, scale)?;
++                let code = f.binary(BinOp::FAdd, code, half)?;
++                f.convert(ConvOp::ConvertFToU, code, u32_)?
++            };
++            let uvec4 = f.module().ty(Type::Vector { elem: u32_, len: 4 })?;
++            let output = f.module().fixed_io(0, IoDir::Output, uvec4, false)?;
++            let zero = uint(&mut f, 0)?;
++            let texel = f.composite_construct(uvec4, &[bits, zero, zero, zero])?;
++            let output = f.module().global_value(output)?;
++            f.store(output, texel, MemAccess::default())?;
++        }
+         (ResolveWrite::StencilExport, Some(stencil)) => {
+             let reference = f.convert(ConvOp::Bitcast, stencil, i32_)?;
+             let output =
+@@ -269,7 +301,7 @@ pub fn fragment_typed_module(draw: DepthStencilResolveDraw) -> BResult<TypedModu
+     match draw.write {
+         ResolveWrite::Depth => modes.push(ExecMode::DepthReplacing),
+         ResolveWrite::StencilExport => modes.push(ExecMode::StencilRefReplacing),
+-        ResolveWrite::StencilPlane(_) => {}
++        ResolveWrite::StencilPlane(_) | ResolveWrite::Depth32Bits | ResolveWrite::Depth16Bits => {}
+     }
+     b.entry(ExecModel::Fragment, id, modes)?;
+     b.finalize()

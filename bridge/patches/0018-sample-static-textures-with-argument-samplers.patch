@@ -1,0 +1,656 @@
+diff --git a/crates/metal2vulkan-runtime/src/address_map.rs b/crates/metal2vulkan-runtime/src/address_map.rs
+index 208c1ff..9c06254 100644
+--- a/crates/metal2vulkan-runtime/src/address_map.rs
++++ b/crates/metal2vulkan-runtime/src/address_map.rs
+@@ -102,6 +102,8 @@ pub(super) enum Pair {
+         texture: SlotRef,
+         modes: Option<[SamplerAddressMode; 3]>,
+     },
++    /// A texture slot sampled through a sampler handle whose state the layout does not fix.
++    HeapSampler { texture: SlotRef },
+ }
+ 
+ /// The texture slots `layout` samples, each with its sampler, and whether a function of it
+@@ -137,6 +139,12 @@ pub(super) fn pairs(layout: &PipelineLayout) -> (Vec<Pair>, bool) {
+             | BindingSource::Heap(HandleClass::Sampler { .. }) => {
+                 handles = true;
+             }
++            BindingSource::SampledTexture { texture, .. } => {
++                let pair = Pair::HeapSampler { texture };
++                if !pairs.contains(&pair) {
++                    pairs.push(pair);
++                }
++            }
+             _ => {}
+         }
+     }
+@@ -167,6 +175,12 @@ pub(super) fn resolve(
+         BTreeMap::new();
+     for pair in pairs {
+         match *pair {
++            Pair::HeapSampler { texture } => {
++                let map = map_of(texture);
++                if !map.is_identity() {
++                    return Err(refuse(map, MappedSampling::Handles));
++                }
++            }
+             Pair::Constexpr { texture, modes } => {
+                 // A constexpr sampler samples a mapped texture through the pipeline variant of
+                 // its slot (`VariantKey::address_maps`), whose state holds its modes mapped, as
+diff --git a/crates/metal2vulkan/src/bind/plan/compute.rs b/crates/metal2vulkan/src/bind/plan/compute.rs
+index cbb9a9f..48d4466 100644
+--- a/crates/metal2vulkan/src/bind/plan/compute.rs
++++ b/crates/metal2vulkan/src/bind/plan/compute.rs
+@@ -601,6 +601,17 @@ fn plan(p: &ComputePipeline, device: &Device, shape: &BindShape) -> Result<Bindi
+                     })?;
+                     resources.separate_texture(texture, sampler, *immutable)?
+                 }
++                BindingSource::SampledTexture {
++                    texture,
++                    compare,
++                    raw,
++                } => {
++                    let source = resources.sampled_texture(texture, compare, raw)?;
++                    if let Some(h) = heap.as_mut() {
++                        h.sampled_texture(shape, texture, compare, &source)?;
++                    }
++                    source
++                }
+                 // The consumer builds the structures (`bind::acceleration`).
+                 BindingSource::AccelerationStructure { slot, level } => {
+                     WriteSource::AccelerationStructure { slot, level }
+diff --git a/crates/metal2vulkan/src/lower/sampler/emit.rs b/crates/metal2vulkan/src/lower/sampler/emit.rs
+index 58edcde..5f195da 100644
+--- a/crates/metal2vulkan/src/lower/sampler/emit.rs
++++ b/crates/metal2vulkan/src/lower/sampler/emit.rs
+@@ -675,6 +675,29 @@ pub(super) fn sampled_image(
+             };
+             Ok((si, image, Some(element.live)))
+         }
++        Source::SlotHeapSampler {
++            texture,
++            sampler,
++            key,
++            raw,
++        } => {
++            let Some(&array) = cx.decl.families.sampler.slot_heap_samplers.get(&key) else {
++                return Err(cx.fail(format!("argument sampler array {key:?} is not declared")));
++            };
++            let Some(&(image, facts)) = cx.decl.families.sampler.slot_heap_images
++                .get(&(texture, key.compare, raw))
++            else {
++                return Err(cx.fail(format!("texture slot {texture} has no sampled image")));
++            };
++            let image = fb.module().global_value(image)?;
++            let image = fb.load(image, MemAccess::default())?;
++            let index = heap_sampler_field(cx, fb, sampler, EntryField::Element)?;
++            let array = fb.module().global_value(array)?;
++            let pointer = fb.access_chain_non_uniform(array, index)?;
++            let sampler = fb.load(pointer, MemAccess::default())?;
++            let sampled = fb.sampled_image(image, sampler)?;
++            Ok((sampled, facts, None))
++        }
+     }
+ }
+ 
+@@ -711,7 +734,7 @@ pub fn sampling_value(
+     // A texture the heap holds by its raw texels alone: Metal's sample or gather of it, after
+     // the device's access, which stays where it was.
+     let value = match &s.heap_raw {
+-        Some(raw) => super::heap_raw::emit(cx, fb, s, raw, value)?,
++        Some(raw) => super::heap_raw::emit(cx, fb, s, raw, value, grads)?,
+         None => value,
+     };
+     // A texture of another class: its own result's words handed back as declared.
+@@ -719,7 +742,8 @@ pub fn sampling_value(
+         Some(d) => declared_value(cx, fb, s, d, value)?,
+         None => value,
+     };
+-    if let Source::HeapSampler { sampler, .. } = s.source {
++    if let Source::HeapSampler { sampler, .. } | Source::SlotHeapSampler { sampler, .. } = s.source
++    {
+         if cx.plan.families.sampler.cubic_reach {
+             cubic_reach(cx, fb, sampler)?;
+         }
+@@ -742,13 +766,13 @@ fn swizzled_value(
+     s: &Sampling,
+     grads: Option<(SValue, SValue)>,
+ ) -> BResult<SValue> {
+-    let Source::Combined(key) = s.source else {
++    let Some(texture) = s.source.slot() else {
+         return Err(cx.fail("a swizzled sampling of a heap element"));
+     };
+-    let Some(word) = cx.decl.families.texture.swizzle.get(&key.texture).copied() else {
++    let Some(word) = cx.decl.families.texture.swizzle.get(&texture).copied() else {
+         return Err(cx.fail(format!(
+             "texture slot {} has no swizzle constant",
+-            key.texture
++            texture
+         )));
+     };
+     let (texel, status, gathered) = match &s.op {
+@@ -792,7 +816,7 @@ fn swizzled_value(
+     let texel = match s.unmapped {
+         Unmapped::Device => texel,
+         Unmapped::Constants | Unmapped::Named => {
+-            crate::lower::texture::constant_lanes(cx, fb, key.texture, texel, gathered)?
++            crate::lower::texture::constant_lanes(cx, fb, texture, texel, gathered)?
+         }
+     };
+     with_word(cx, fb, &s.result, texel, status)
+@@ -899,10 +923,7 @@ pub(super) fn sampled_value(
+     let arm = sparse_arm(cx, s)?;
+     // A tile map answers a pixel sampler's fetch and a sample or gather with Metal's footprint:
+     // selection gives a slot whose observed samples or gathers it does not answer no tile-map arm.
+-    let tiled = match s.source {
+-        Source::Combined(key) => tile_map(cx, key.texture),
+-        Source::Heap { .. } | Source::HeapSampler { .. } => None,
+-    };
++    let tiled = s.source.slot().and_then(|texture| tile_map(cx, texture));
+     let fetched = matches!(s.op, SampleOp::PixelFetch { .. });
+     if arm.is_some() && tiled.is_some() && !fetched && s.footprint.is_none() {
+         return Err(cx.fail("a filtered sample's residency on a slot with a tile map"));
+@@ -1642,13 +1663,13 @@ pub(super) fn offset_base(
+     cx: &mut EmitCx<'_>,
+     s: &Sampling,
+ ) -> BResult<Option<crate::lower::texture::OffsetBase>> {
+-    match s.source {
+-        Source::Combined(key) if s.offset_base => {
+-            match cx.decl.families.texture.offset_base.get(&key.texture) {
++    match s.source.slot() {
++        Some(texture) if s.offset_base => {
++            match cx.decl.families.texture.offset_base.get(&texture) {
+                 Some(&base) => Ok(Some(base)),
+                 None => Err(cx.fail(format!(
+                     "texture slot {} has no OffsetBaseAxes specialization",
+-                    key.texture
++                    texture
+                 ))),
+             }
+         }
+@@ -1931,7 +1952,7 @@ fn past_limit(
+ /// so as the `Offset` operand it lies in the device's range, which selection checked contains
+ /// Metal's (VUID-RuntimeSpirv-OpImageSample-06435/06436, OpImage-06376/06377); a pixel fetch adds
+ /// it to the texel coordinate.
+-fn metal_offset(
++pub(super) fn metal_offset(
+     cx: &mut EmitCx<'_>,
+     fb: &mut FunctionBuilder<'_>,
+     v: ValueId,
+@@ -2088,7 +2109,9 @@ pub(super) fn word_pixel(s: &Sampling) -> Option<Pixel> {
+                 ..
+             },
+         ) => Some(Pixel::Spec(n)),
+-        (_, Source::HeapSampler { sampler, .. }) => Some(Pixel::Heap(sampler)),
++        (_, Source::HeapSampler { sampler, .. } | Source::SlotHeapSampler { sampler, .. }) => {
++            Some(Pixel::Heap(sampler))
++        }
+         _ => None,
+     }
+ }
+@@ -2215,10 +2238,7 @@ fn pixel_fetch(
+             fb.fetch(img, at, &ops)
+         }
+     };
+-    let tiled = match s.source {
+-        Source::Combined(key) => tile_map(cx, key.texture),
+-        _ => None,
+-    };
++    let tiled = s.source.slot().and_then(|texture| tile_map(cx, texture));
+     let (x, word) = match (arm, tiled) {
+         // A tile map: the plain fetch, and the residency of the fetched texel's tile at level 0.
+         (Some((spec, _)), Some(map)) => {
+@@ -2311,7 +2331,7 @@ pub(super) fn held_constants(
+     s: &Sampling,
+     held: SValue,
+ ) -> BResult<SValue> {
+-    let Source::Combined(key) = s.source else {
++    let Some(texture) = s.source.slot() else {
+         return Ok(held);
+     };
+     // A swizzled slot's sampling sets them after its swizzle ([`swizzled_value`]).
+@@ -2322,7 +2342,7 @@ pub(super) fn held_constants(
+         SampleOp::Gather { component, .. } => Some(component),
+         _ => None,
+     };
+-    crate::lower::texture::constant_lanes(cx, fb, key.texture, held, gathered)
++    crate::lower::texture::constant_lanes(cx, fb, texture, held, gathered)
+ }
+ 
+ /// The four-lane vector type of `x` and its element type.
+@@ -2382,8 +2402,9 @@ pub(super) fn held_value(
+     // may be one texel's likewise. Each takes the access's lanes. Not where the sample's texel is
+     // the device's (`Sampling::half_texel`): it is held.
+     let half = match s.source {
+-        Source::Combined(key) if !s.depth && s.half_texel => {
+-            half_class(cx, &ImageRef::Slot(key.texture), form)
++        Source::Combined(super::BindingKey { texture, .. })
++        | Source::SlotHeapSampler { texture, .. } if !s.depth && s.half_texel => {
++            half_class(cx, &ImageRef::Slot(texture), form)
+         }
+         Source::Heap { handle, .. } | Source::HeapSampler { handle, .. }
+             if !s.depth && s.half_texel =>
+@@ -2393,8 +2414,9 @@ pub(super) fn held_value(
+         _ => None,
+     };
+     let float = match s.source {
+-        Source::Combined(key) if s.float_texel => {
+-            match float_class(cx, &ImageRef::Slot(key.texture), form) {
++        Source::Combined(super::BindingKey { texture, .. })
++        | Source::SlotHeapSampler { texture, .. } if s.float_texel => {
++            match float_class(cx, &ImageRef::Slot(texture), form) {
+                 Some(f) => Some(f),
+                 None => return Err(cx.fail("a `float` sample without its conversion routine")),
+             }
+diff --git a/crates/metal2vulkan/src/lower/sampler/fetched.rs b/crates/metal2vulkan/src/lower/sampler/fetched.rs
+index 00aa9c2..454fe9e 100644
+--- a/crates/metal2vulkan/src/lower/sampler/fetched.rs
++++ b/crates/metal2vulkan/src/lower/sampler/fetched.rs
+@@ -74,8 +74,8 @@ use crate::spirv::ids::{ConstId, FuncId, TypeId, Value as SValue};
+ use crate::spirv::ir::{BinOp, Constant, ConvOp, GlslOp, ImageQuery, Type as SType};
+ 
+ use super::bicubic::{
+-    flag, footprint_from, footprint_on, missing_routine, scalar, value, Addressing, At, Bits,
+-    Footprint, Tap, TapAddress, TapBase, Taps, Texels, Tys,
++    Addressing, At, Bits, Footprint, Tap, TapAddress, TapBase, Taps, Texels, Tys, flag,
++    footprint_from, footprint_on, missing_routine, scalar, value,
+ };
+ use super::level::LevelSnap;
+ use super::linear::LinearImage;
+@@ -451,15 +451,35 @@ pub(super) fn branch(
+     image: CombinedImage,
+     fetched: &dyn Fn(&mut FunctionBuilder<'_>, &[SValue]) -> BResult<SValue>,
+     device: &dyn Fn(&mut FunctionBuilder<'_>, SValue) -> BResult<SValue>,
++) -> BResult<SValue> {
++    branch_source(
++        cx,
++        fb,
++        (s, Source::Combined(key)),
++        (texture, f, classes, reached),
++        image,
++        fetched,
++        device,
++    )
++}
++
++/// The slot fetch branch obtains its sampled image from either a bound sampler
++/// pair or an argument-buffer sampler. Argument samplers provide their table
++/// word in the caller's function and keep the fetches in that function.
++pub(super) fn branch_source(
++    cx: &mut EmitCx<'_>,
++    fb: &mut FunctionBuilder<'_>,
++    (s, source): (&Sampling, Source),
++    (texture, f, classes, reached): (u32, &Fetch, u32, bool),
++    image: CombinedImage,
++    fetched: &dyn Fn(&mut FunctionBuilder<'_>, &[SValue]) -> BResult<SValue>,
++    device: &dyn Fn(&mut FunctionBuilder<'_>, SValue) -> BResult<SValue>,
+ ) -> BResult<SValue> {
+     let Some(spec) = crate::lower::texture::texel_format_const(cx, texture) else {
+         return Err(cx.fail(format!(
+             "texture slot {texture} has no `TexelFormat` specialization"
+         )));
+     };
+-    let Some(&(binding, _)) = cx.decl.families.sampler.combined.get(&key) else {
+-        return Err(cx.fail(format!("combined binding {key:?} is not declared")));
+-    };
+     // A runtime sampler's word, which addresses its taps.
+     let word = match &f.address {
+         FetchAddress::Word { sampler, .. } => {
+@@ -467,7 +487,10 @@ pub(super) fn branch(
+         }
+         FetchAddress::Modes { .. } => None,
+         FetchAddress::Entry { .. } => {
+-            return Err(cx.fail("a slot's fetch addressed by an argument buffer's sampler"))
++            let Source::SlotHeapSampler { sampler, .. } = source else {
++                return Err(cx.fail("an argument-addressed slot fetch without its sampler"));
++            };
++            Some(super::emit::sampler_word(cx, fb, Pixel::Heap(sampler))?)
+         }
+     };
+     let t = Tys::new(fb)?;
+@@ -481,7 +504,11 @@ pub(super) fn branch(
+     };
+     // A sample's one texel is fetched by its shape's routine, called with the sample's plain
+     // data (`routine::Fetched`); a gather's four, and a blend's two levels, inline.
+-    let routed = match (Fetched::of(s, key, texture, f), image.texel) {
++    let shape = match source {
++        Source::Combined(key) => Fetched::of(s, key, texture, f),
++        _ => None,
++    };
++    let routed = match (shape, image.texel) {
+         (Some(shape), TexelClass::Float) => {
+             Some(fetch_routine(cx, fb, s, shape, f, (image, spec))?)
+         }
+@@ -495,7 +522,7 @@ pub(super) fn branch(
+                 fetched(fb, &[x])?
+             }
+             None => {
+-                let si = binding.sampled_image(fb)?;
++                let (si, _, _) = super::emit::sampled_image(cx, fb, source)?;
+                 let level = level(cx, fb, t, s, (f.level, word), si)?;
+                 let Some(taps) = f.taps(s, level, word) else {
+                     return Err(cx.fail("a word-addressed fetch without its word"));
+@@ -506,8 +533,8 @@ pub(super) fn branch(
+         };
+         Ok(ArmEnd::FallThrough(vec![x]))
+     });
+-    let read: ArmFn<'_, EmitCx<'_>> = Box::new(move |fb, _| {
+-        let si = binding.sampled_image(fb)?;
++    let read: ArmFn<'_, EmitCx<'_>> = Box::new(move |fb, cx| {
++        let (si, _, _) = super::emit::sampled_image(cx, fb, source)?;
+         let x = device(fb, si)?;
+         Ok(ArmEnd::FallThrough(vec![x]))
+     });
+@@ -559,7 +586,9 @@ pub(super) fn heap(
+ ) -> BResult<SValue> {
+     let handle = match s.source {
+         Source::Heap { handle, .. } | Source::HeapSampler { handle, .. } => handle,
+-        Source::Combined(_) => return Err(cx.fail("a heap texture's fetch of a slot")),
++        Source::Combined(_) | Source::SlotHeapSampler { .. } => {
++            return Err(cx.fail("a heap texture's fetch of a slot"));
++        }
+     };
+     let t = Tys::new(fb)?;
+     let h = cx.operand(fb, handle)?;
+@@ -857,7 +886,7 @@ fn level_at(
+             fb.convert(ConvOp::ConvertFToU, l, t.u32_)?
+         }
+         (Level::Snapped(_), None) => {
+-            return Err(cx.fail("a snapped fetch level without its operand"))
++            return Err(cx.fail("a snapped fetch level without its operand"));
+         }
+         (Level::Word { .. }, x) => {
+             let Some(word) = word else {
+@@ -990,7 +1019,7 @@ fn define(
+         )?),
+         FetchAddress::Modes { .. } => None,
+         FetchAddress::Entry { .. } => {
+-            return Err(cx.fail("a slot's fetch addressed by an argument buffer's sampler"))
++            return Err(cx.fail("a slot's fetch addressed by an argument buffer's sampler"));
+         }
+     };
+     let si = binding.sampled_image(&mut fb)?;
+diff --git a/crates/metal2vulkan/src/lower/sampler/linear.rs b/crates/metal2vulkan/src/lower/sampler/linear.rs
+index 299f424..7a77527 100644
+--- a/crates/metal2vulkan/src/lower/sampler/linear.rs
++++ b/crates/metal2vulkan/src/lower/sampler/linear.rs
+@@ -175,14 +175,14 @@ use crate::air::intrinsics::{ImageDim, ImageShape};
+ use crate::air::ir::ValueId;
+ use crate::error::Error;
+ use crate::lower::emit::EmitCx;
+-use crate::lower::select::{any_of, both, NoteClause, NoteOn, NoteTest, SelectCx};
+-use crate::lower::texture::half::HalfForm;
++use crate::lower::select::{NoteClause, NoteOn, NoteTest, SelectCx, any_of, both};
+ use crate::lower::texture::OffsetBase;
+-use crate::lower::texture::{half_class, ImageRef, TexelConv, TexelForm};
++use crate::lower::texture::half::HalfForm;
++use crate::lower::texture::{ImageRef, TexelConv, TexelForm, half_class};
++use crate::metal::SamplerAddressMode;
+ use crate::metal::bicubic::BicubicTexels;
+ use crate::metal::sampler::SamplerWord;
+-use crate::metal::texel_format::{texel_format, PackedTexels, TexelFormat};
+-use crate::metal::SamplerAddressMode;
++use crate::metal::texel_format::{PackedTexels, TexelFormat, texel_format};
+ use crate::pipeline::artifact::PrecisionNote;
+ use crate::pipeline::sym::SamplerRef;
+ use crate::spirv::builder::constructs::{ArmEnd, ArmFn, Merged};
+@@ -193,8 +193,8 @@ use crate::spirv::ir::{BinOp, ConstBits, Constant, Type as SType, UnOp};
+ 
+ use super::bicubic::routines::Routine;
+ use super::bicubic::{
+-    self, flag, footprint, footprint_from, footprint_on, scalar, value, Addressing, At, Bits,
+-    Footprint, Tap, TapAddress, TapBase, Taps, Texels, Tys,
++    self, Addressing, At, Bits, Footprint, Tap, TapAddress, TapBase, Taps, Texels, Tys, flag,
++    footprint, footprint_from, footprint_on, scalar, value,
+ };
+ use super::face::{FaceRoutines, FaceWrap};
+ use super::routine::{Emulation, Shape};
+@@ -205,8 +205,8 @@ use compare::TapCompare;
+ pub(super) mod compare;
+ mod cube;
+ 
+-pub(super) use cube::select_gather;
+ pub use cube::CubeGather;
++pub(super) use cube::select_gather;
+ 
+ /// A linear sample with a `half` result emulated by fetches (module docs).
+ #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+@@ -942,23 +942,26 @@ pub(super) fn emit(
+             "texture slot {texture} has no `TexelFormat` specialization"
+         )));
+     };
+-    let Source::Combined(key) = s.source else {
++    if !matches!(
++        s.source,
++        Source::Combined(_) | Source::SlotHeapSampler { .. }
++    ) {
+         return Err(cx.fail("a linear sample of a heap element"));
+-    };
+-    // The combined binding, or its separate texture and sampler: each arm makes the sampled image
+-    // in its own block, where it is consumed.
+-    let Some(&(binding, _)) = cx.decl.families.sampler.combined.get(&key) else {
+-        return Err(cx.fail(format!("combined binding {key:?} is not declared")));
+-    };
++    }
+     let t = Tys::new(fb)?;
+     let word = state_word(cx, fb, l)?;
+-    // The emulation is its shape's routine, called with the sample's plain data (`routine`).
+-    let (routine, args) = emulation(cx, fb, s, (plane, dref), spec)?;
++    let routed = match s.source {
++        Source::Combined(_) => Some(emulation(cx, fb, s, (plane, dref), spec)?),
++        _ => None,
++    };
+     // A constexpr sampler's raw emulation has no device arm.
+     if let (true, None) = (l.raw, word) {
+-        return fb
+-            .call(routine, &args)?
+-            .ok_or_else(bicubic::missing_routine);
++        return match &routed {
++            Some((routine, args)) => fb
++                .call(*routine, args)?
++                .ok_or_else(bicubic::missing_routine),
++            None => emulation_inline(cx, fb, s, (plane, dref), spec, half),
++        };
+     }
+     let h = match (half, s.half_texel) {
+         (true, true) => match s
+@@ -995,10 +998,13 @@ pub(super) fn emit(
+     // A native class's sample is the device's, at Metal's footprint step (`native`).
+     let measured = without_native(fb, measured, native)?;
+     // The emulation: its routine's call.
+-    let emulated: ArmFn<'_, EmitCx<'_>> = Box::new(move |fb, _| {
+-        let x = fb
+-            .call(routine, &args)?
+-            .ok_or_else(bicubic::missing_routine)?;
++    let emulated: ArmFn<'_, EmitCx<'_>> = Box::new(move |fb, cx| {
++        let x = match &routed {
++            Some((routine, args)) => fb
++                .call(*routine, args)?
++                .ok_or_else(bicubic::missing_routine)?,
++            None => emulation_inline(cx, fb, s, (plane, dref), spec, half)?,
++        };
+         Ok(ArmEnd::FallThrough(vec![x]))
+     });
+     // The device's sample, which reads one texel where a runtime sampler's word states nearest
+@@ -1020,17 +1026,17 @@ pub(super) fn emit(
+     };
+     let filtered: ArmFn<'_, EmitCx<'_>> = Box::new(move |fb, cx| {
+         let x = match nearest {
+-            Some(p) => super::fetched::branch(
++            Some(p) => super::fetched::branch_source(
+                 cx,
+                 fb,
+-                (s, key),
++                (s, s.source),
+                 (texture, &p.fetch, BicubicTexels::LINEAR, true),
+                 image,
+                 &super::fetched::one,
+                 device,
+             )?,
+             None => {
+-                let si = binding.sampled_image(fb)?;
++                let (si, _, _) = super::emit::sampled_image(cx, fb, s.source)?;
+                 device(fb, si)?
+             }
+         };
+@@ -1094,12 +1100,12 @@ pub(super) fn gather(
+     if g.raw {
+         return cube::gather(cx, fb, &t, s, g, at, Some(spec));
+     }
+-    let Source::Combined(key) = s.source else {
++    if !matches!(
++        s.source,
++        Source::Combined(_) | Source::SlotHeapSampler { .. }
++    ) {
+         return Err(cx.fail("a cube gather of a heap element"));
+-    };
+-    let Some(&(binding, _)) = cx.decl.families.sampler.combined.get(&key) else {
+-        return Err(cx.fail(format!("combined binding {key:?} is not declared")));
+-    };
++    }
+     let measured = flag(
+         fb,
+         &t,
+@@ -1114,8 +1120,8 @@ pub(super) fn gather(
+         let x = cube::gather(cx, fb, t, s, g, at, Some(spec))?;
+         Ok(ArmEnd::FallThrough(vec![x]))
+     });
+-    let gathered: ArmFn<'_, EmitCx<'_>> = Box::new(move |fb, _| {
+-        let si = binding.sampled_image(fb)?;
++    let gathered: ArmFn<'_, EmitCx<'_>> = Box::new(move |fb, cx| {
++        let (si, _, _) = super::emit::sampled_image(cx, fb, s.source)?;
+         Ok(ArmEnd::FallThrough(vec![device(fb, si)?]))
+     });
+     let Merged(merged) = fb.if_(cx, measured, emulated, Some(gathered))?;
+@@ -1225,7 +1231,9 @@ pub(super) fn emit_heap(
+     let half = half_result(cx, s)?;
+     let handle = match s.source {
+         Source::Heap { handle, .. } | Source::HeapSampler { handle, .. } => handle,
+-        Source::Combined(_) => return Err(cx.fail("a heap texture's linear sample of a slot")),
++        Source::Combined(_) | Source::SlotHeapSampler { .. } => {
++            return Err(cx.fail("a heap texture's linear sample of a slot"));
++        }
+     };
+     let t = Tys::new(fb)?;
+     let h = cx.operand(fb, handle)?;
+@@ -1319,6 +1327,60 @@ fn emulation(
+     Ok((f, args))
+ }
+ 
++/// The inline linear filter reads an argument sampler in the function that
++/// owns its handle. Its taps use the non-comparison sampled view; cube taps
++/// continue to use the texture slot's face-array view.
++fn emulation_inline(
++    cx: &mut EmitCx<'_>,
++    fb: &mut FunctionBuilder<'_>,
++    s: &Sampling,
++    (plane, dref): (SValue, Option<SValue>),
++    spec: ConstId,
++    half: bool,
++) -> BResult<SValue> {
++    let Some(l) = s.linear.as_ref() else {
++        return Err(cx.fail("an inline linear sample without its filter plan"));
++    };
++    let t = Tys::new(fb)?;
++    let at = At::of(cx, fb, s)?;
++    let word = state_word(cx, fb, l)?;
++    let bits = Bits::Spec(spec);
++
++    if let Some(face) = l.cube {
++        return cube::emulate(
++            cx,
++            fb,
++            &t,
++            at.layer,
++            (l, word),
++            (face, plane),
++            (bits, half, dref),
++        );
++    }
++
++    let Source::SlotHeapSampler {
++        texture,
++        sampler,
++        key,
++        ..
++    } = s.source
++    else {
++        return Err(cx.fail("an inline linear filter without an argument sampler"));
++    };
++    let taps = Source::SlotHeapSampler {
++        texture,
++        sampler,
++        key: super::SlotHeapSamplerKey {
++            compare: false,
++            ..key
++        },
++        raw: l.raw,
++    };
++    let (si, image, _) = super::emit::sampled_image(cx, fb, taps)?;
++
++    emulate(cx, fb, &t, &at, (si, image), (l, word), (bits, half, dref))
++}
++
+ /// Define the routine of emulated arm `e` (`routine::Emulation`) in `mb`, its parameters of
+ /// types `tys` in [`emulation`]'s order, its offset placed by the slot's tests `parent` where `e`
+ /// reads them: the texel the arm's code gave inline, read from `e`'s bindings and specializations
+diff --git a/crates/metal2vulkan/src/lower/texture/slot.rs b/crates/metal2vulkan/src/lower/texture/slot.rs
+index f075342..4473510 100644
+--- a/crates/metal2vulkan/src/lower/texture/slot.rs
++++ b/crates/metal2vulkan/src/lower/texture/slot.rs
+@@ -1270,10 +1270,23 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
+             ));
+             h.raw = (h.reads_raw && sampled_float).then_some((
+                 ImageHandleClass {
++                    dim: if class.dim == SymDim::Cube {
++                        SymDim::D2
++                    } else {
++                        class.dim
++                    },
++                    arrayed: class.arrayed || class.dim == SymDim::Cube,
+                     sampled_type: SampledType::Uint,
+                     ..class
+                 },
+                 ImageDecl {
++                    dim: if decl.dim == Dim::Cube {
++                        Dim::D2
++                    } else {
++                        decl.dim
++                    },
++                    arrayed: decl.arrayed || decl.dim == Dim::Cube,
++                    cube_as_array: decl.dim == Dim::Cube,
+                     texel: TexelClass::Uint,
+                     ..decl
+                 },
+diff --git a/crates/metal2vulkan/src/pipeline/layout.rs b/crates/metal2vulkan/src/pipeline/layout.rs
+index 1315f5b..45bcea4 100644
+--- a/crates/metal2vulkan/src/pipeline/layout.rs
++++ b/crates/metal2vulkan/src/pipeline/layout.rs
+@@ -123,6 +123,14 @@ pub enum BindingSource {
+     /// draw's render pass instance holds (`ResourceKind::ExtendedShadow`), bound as a storage
+     /// image.
+     ExtendedShadow(u32),
++    /// The sampled view of a texture slot read through an argument-buffer sampler. The view
++    /// keeps the texture's sampling type; `compare` selects depth and `raw` selects sRGB's UNORM
++    /// channels. The sampler comes from the sampler heap independently of this binding.
++    SampledTexture {
++        texture: SlotRef,
++        compare: bool,
++        raw: bool,
++    },
+ }
+ 
+ /// One push-constant range of a [`PipelineLayout`]: a stage's fixed window (vertex `[0, 64)`,
+diff --git a/crates/metal2vulkan/src/spirv/builder/module.rs b/crates/metal2vulkan/src/spirv/builder/module.rs
+index c5228cb..d946627 100644
+--- a/crates/metal2vulkan/src/spirv/builder/module.rs
++++ b/crates/metal2vulkan/src/spirv/builder/module.rs
+@@ -555,7 +555,7 @@ impl ModuleBuilder {
+         // sampler.
+         let ok = ok
+             && match sym.kind {
+-                ResourceKind::SeparateTexture(_) => matches!(
++                ResourceKind::SeparateTexture(_) | ResourceKind::SampledTexture { .. } => matches!(
+                     self.types.get(ty)?,
+                     Type::Image(ImageType {
+                         usage: ImageUsage::Sampled,
