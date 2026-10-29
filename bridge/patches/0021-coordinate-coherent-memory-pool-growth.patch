@@ -1,0 +1,188 @@
+diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
+index 1f882747..b5491a5b 100644
+--- a/crates/metal2vulkan-runtime/src/memory.rs
++++ b/crates/metal2vulkan-runtime/src/memory.rs
+@@ -60,7 +60,7 @@ use crate::release;
+ use ash::vk;
+ use metal2vulkan::vk::DriverId;
+ use std::ptr::NonNull;
+-use std::sync::{Arc, Mutex};
++use std::sync::{Arc, Mutex, TryLockError};
+ use std::time::{Duration, Instant};
+ 
+ /// The size of a pooled block, at most the device's `maxMemoryAllocationSize`.
+@@ -104,7 +104,8 @@ pub(super) enum MemoryClass {
+     /// words): without unified memory device-local where the device has such
+     /// (resizable BAR), else as `Shared`; with unified memory as `Shared` ([`candidates`]).
+     WriteCombined,
+-    /// Device-local (`Private` storage), host-invisible where the device has a choice.
++    /// Device-local (`Private` storage), preferring cached coherent memory on unified-memory
++    /// devices and host-invisible memory on discrete devices.
+     Private,
+     /// Host-visible and coherent (`Managed` storage), host-cached where the device has such
+     /// memory: a managed resource is there for the CPU to read back. On a device with unified
+@@ -253,6 +254,8 @@ pub(super) fn host_cached_placement(
+ /// GPU uses a shared resource; `Device::new_buffer` announces it
+ /// (`Degradation::SharedInSystemMemory`). So without unified memory `WriteCombined` memory, which
+ /// the host does not read, prefers a device-local type; with unified memory it is `Shared` memory.
++/// Private allocations on unified-memory devices prefer cached coherent device-local memory.
++/// Memoryless attachments prefer lazy allocation, then cached coherent memory for eager backing.
+ pub(super) fn candidates(
+     types: &[vk::MemoryType],
+     allowed: u32,
+@@ -274,7 +277,17 @@ pub(super) fn candidates(
+             [P::HOST_CACHED, P::DEVICE_LOCAL],
+             P::empty(),
+         ),
++        MemoryClass::Private if unified => (
++            P::DEVICE_LOCAL,
++            [P::HOST_CACHED | P::HOST_COHERENT, P::empty()],
++            P::empty(),
++        ),
+         MemoryClass::Private => (P::DEVICE_LOCAL, [P::empty(); 2], P::HOST_VISIBLE),
++        MemoryClass::Memoryless if unified => (
++            P::DEVICE_LOCAL,
++            [P::LAZILY_ALLOCATED, P::HOST_CACHED | P::HOST_COHERENT],
++            P::empty(),
++        ),
+         MemoryClass::Memoryless => (
+             P::DEVICE_LOCAL,
+             [P::LAZILY_ALLOCATED, P::empty()],
+@@ -628,7 +641,9 @@ impl<T> Pool<T> {
+             let (count, total) = match (imported(&block.payload), block.dedicated) {
+                 (true, _) => (&mut census.imported, &mut census.imported_bytes),
+                 (false, true) => (&mut census.dedicated, &mut census.dedicated_bytes),
+-                (false, false) if block.ranges.is_empty() => (&mut census.empty, &mut census.empty_bytes),
++                (false, false) if block.ranges.is_empty() => {
++                    (&mut census.empty, &mut census.empty_bytes)
++                }
+                 (false, false) => {
+                     census.pooled_used_bytes += block.ranges.used();
+                     (&mut census.pooled, &mut census.pooled_bytes)
+@@ -1014,11 +1029,17 @@ impl Placement {
+     }
+ }
+ 
+-/// The device's memory: one [`Pool`] per memory type for buffers, and one for images.
++/// The device's memory contains separate buffer and image pools for each memory type.
++/// Placements and releases take the memory mutex. An allocator that needs another pooled block
++/// releases that mutex before taking the pool's growth mutex, then searches the pool again.
++/// This lets concurrent misses use the first allocator's block while existing allocations and
++/// releases continue during the driver's allocation call.
+ pub(super) struct Memory {
+     types: Vec<vk::MemoryType>,
+     /// The buffers' pools by memory type, then the images' ([`Memory::pool`]).
+     pools: Vec<Pool<Block>>,
++    /// One allocation mutex per pool, in the same order as `pools`.
++    growth: Vec<Arc<Mutex<()>>>,
+     block_bytes: u64,
+     /// Blocks are allocated with `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT`: the device enabled
+     /// `bufferDeviceAddress`, so buffers carry device addresses.
+@@ -1073,6 +1094,9 @@ impl Memory {
+             pools: (types.iter().chain(&types))
+                 .map(|_| Pool::default())
+                 .collect(),
++            growth: (types.iter().chain(&types))
++                .map(|_| Arc::new(Mutex::new(())))
++                .collect(),
+             types,
+             block_bytes: BLOCK_BYTES.min(max_allocation.max(1)),
+             device_address,
+@@ -2083,9 +2107,8 @@ pub(super) fn allocate_addressed(
+ 
+ /// [`allocate`], in a block with a buffer of addresses where `addressed` gives the counts of the
+ /// buffers of addresses made, of the blocks that hold `holds`, pooled or in a block of its own
+-/// as `fit` says. A new block is made with `memory`'s lock released: the device's other threads'
+-/// placements, which the lock orders, wait for no `vkAllocateMemory`, which on NVIDIA's driver
+-/// waited 2.37 s for other processes' GPU work.
++/// as `fit` says. A new block is made with `memory`'s lock released. Pooled growth takes that
++/// pool's allocation mutex, searches for room again, then computes its current growth size.
+ fn place(
+     memory: &Mutex<Memory>,
+     device: &ash::Device,
+@@ -2112,10 +2135,6 @@ fn place(
+     let mut failure = Error::OutOfMemory(MemoryKind::Device);
+     for type_index in candidates {
+         let pool = (holds, type_index);
+-        let block_size = match dedicated {
+-            true => size,
+-            false => lock(memory).next_block_bytes(pool, size),
+-        };
+         if fit == Fit::Pooled {
+             if let Some(placement) =
+                 lock(memory).place_pooled(device, pool, (size, align), addressed, class)?
+@@ -2123,6 +2142,28 @@ fn place(
+                 return Ok(placement);
+             }
+         }
++
++        let growth = if dedicated {
++            None
++        } else {
++            let memory = lock(memory);
++            Some(Arc::clone(
++                &memory.growth[memory.pool_at(holds, type_index)],
++            ))
++        };
++        let _growing = growth.as_ref().map(|growth| lock(growth));
++        if growth.is_some() {
++            if let Some(placement) =
++                lock(memory).place_pooled(device, pool, (size, align), addressed, class)?
++            {
++                return Ok(placement);
++            }
++        }
++
++        let block_size = match dedicated {
++            true => size,
++            false => lock(memory).next_block_bytes(pool, size),
++        };
+         // The type's kept empty blocks go before a block of it fails to be made.
+         let made = match maker.make(device, type_index, block_size, addressed) {
+             Err(Error::OutOfMemory(_)) if lock(memory).release_kept(device, type_index) > 0 => {
+@@ -2151,7 +2192,8 @@ fn place(
+ /// that an encoding or a commit, which must wait for no other process's GPU work, finds a block
+ /// with room rather than making one. A block of buffers gets its buffer of addresses (counted in
+ /// `counts`) where blocks carry one. A block that fails to be made, or a pool the query fails for,
+-/// is left to the placement that needs it.
++/// is left to the placement that needs it. A pool already growing is skipped; its allocator
++/// publishes the block before releasing the pool's growth mutex.
+ pub(super) fn keep_room(memory: &Mutex<Memory>, device: &ash::Device, counts: &Counters) {
+     let (lacking, maker) = {
+         let mut memory = lock(memory);
+@@ -2163,14 +2205,33 @@ pub(super) fn keep_room(memory: &Mutex<Memory>, device: &ash::Device, counts: &C
+         let sized: Vec<((Holds, u32), u64)> = (kept.into_iter())
+             .map(|pool| (pool, memory.next_block_bytes(pool, 1)))
+             .collect();
+-        let lacking: Vec<((Holds, u32), u64)> = (sized.into_iter())
++        let lacking: Vec<(Holds, u32)> = (sized.into_iter())
+             .filter(|&((holds, type_index), bytes)| {
+                 !memory.pool(holds, type_index).has_room(bytes / 2)
+             })
++            .map(|(pool, _)| pool)
+             .collect();
+         (lacking, memory.maker())
+     };
+-    for (pool, bytes) in lacking {
++    for pool in lacking {
++        let growth = {
++            let memory = lock(memory);
++            Arc::clone(&memory.growth[memory.pool_at(pool.0, pool.1)])
++        };
++        let _growing = match growth.try_lock() {
++            Ok(guard) => guard,
++            Err(TryLockError::WouldBlock) => continue,
++            Err(TryLockError::Poisoned(error)) => error.into_inner(),
++        };
++        let bytes = {
++            let mut memory = lock(memory);
++            let bytes = memory.next_block_bytes(pool, 1);
++            if memory.pool(pool.0, pool.1).has_room(bytes / 2) {
++                continue;
++            }
++            bytes
++        };
++
+         let addressed = (pool.0 == Holds::Buffers).then_some(counts);
+         let Ok(block) = maker.make(device, pool.1, bytes, addressed) else {
+             continue;

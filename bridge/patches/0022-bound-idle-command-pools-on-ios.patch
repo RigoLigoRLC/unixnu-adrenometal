@@ -1,0 +1,116 @@
+diff --git a/crates/metal2vulkan-runtime/src/spares.rs b/crates/metal2vulkan-runtime/src/spares.rs
+index 5a4ad4e2..1ca2e6b0 100644
+--- a/crates/metal2vulkan-runtime/src/spares.rs
++++ b/crates/metal2vulkan-runtime/src/spares.rs
+@@ -5,18 +5,12 @@
+ //! to 48 us and a descriptor pool 23 to 26 us on RADV (Radeon 780M), 7 to 8 and 3 on ANV, against
+ //! 0.2 and 0.02, and 1.3 and 0.1, reset.
+ //!
+-//! - **Command pools are kept, never released while the device lives**. Every command pool a
+-//!   command buffer gives back is kept, whatever its status, and every command buffer dropped with
+-//!   one gives it back too: the runtime calls `vkDestroyCommandPool` on a command buffer's pool
+-//!   only as the device is torn down, after its queues are idle.
+-//!   The spares stay bounded all the same: a command buffer makes a pool only where no spare of its
+-//!   queue's family is free, so the device holds at most as many as its command buffers held at
+-//!   once (Metal bounds those by each queue's `maxCommandBufferCount`), each holding what its
+-//!   largest command buffer recorded. Before, a pool given back past 8 spares, or one that made
+-//!   more than 64 command buffers, was released on the handler thread that completed its command
+-//!   buffer; on NVIDIA's driver 615.71.09 that `vkDestroyCommandPool` intermittently never returned
+-//!   (the driver spinning, with its own `[vkrt] Analysis` thread), so the command buffer never
+-//!   completed and its queue stalled.
++//! - **Idle command pools on iOS are bounded.** Each queue family keeps at most
++//!   [`COMMAND_POOLS_PER_FAMILY`] pools, each with at most [`COMMAND_BUFFERS_PER_POOL`] command
++//!   buffers including a primary begun ahead. Returning a larger pool releases it; returning
++//!   another pool past the family limit releases the oldest idle pool. Other targets retain
++//!   every returned pool because NVIDIA's driver 615.71.09 intermittently hangs while destroying
++//!   one on the completion thread.
+ //! - **Descriptor pools are bounded.** At most [`DESCRIPTOR_POOLS`] descriptor pools of at most
+ //!   [`DESCRIPTORS`] descriptors together; a descriptor pool given back past them releases the
+ //!   oldest spares first, so the spares follow the shapes in use. The descriptors bound the
+@@ -109,6 +103,12 @@ use ash::vk;
+ use std::collections::VecDeque;
+ use std::sync::Mutex;
+ 
++/// The most idle command pools each iOS queue family retains.
++const COMMAND_POOLS_PER_FAMILY: usize = 8;
++
++/// The most command buffers an idle iOS pool retains, including its primary begun ahead.
++const COMMAND_BUFFERS_PER_POOL: usize = 64;
++
+ /// The most spare descriptor pools a device keeps (of each list, a command buffer's arenas' and
+ /// the fitted arenas'): a few frames' worth of a window server's (the module docs).
+ pub(super) const DESCRIPTOR_POOLS: usize = 256;
+@@ -336,7 +336,7 @@ impl Spares {
+     /// submitted: nothing of it is pending, and nothing else holds it; `settled` where the
+     /// command buffer completed and ended every command buffer of it handed out, so none is
+     /// recording (the module docs). A pool that made no secondary command buffer makes one
+-    /// first. Never released here.
++    /// first. Oversized iOS pools and pools past the family limit are released.
+     pub(super) fn give_command_pool(
+         &self,
+         device: &DeviceShared,
+@@ -345,7 +345,7 @@ impl Spares {
+     ) {
+         pool.recording = !settled;
+         pool.stock(device);
+-        keep_command_pool(&mut lock(&self.command_pools), pool);
++        self.retain_command_pool(device, pool);
+     }
+ 
+     /// Begin a primary ahead in the spare command pool `raw` of `device`, where it is still a
+@@ -358,12 +358,53 @@ impl Spares {
+             return;
+         };
+         let begun = pool.begin_ahead(device);
+-        keep_command_pool(&mut lock(&self.command_pools), pool);
+-        if begun {
++        let retained = self.retain_command_pool(device, pool);
++        if begun && retained {
+             device.counts.primary_begun_ahead();
+         }
+     }
+ 
++    /// Return an idle pool and release storage past the iOS limits. The result says whether
++    /// this pool was retained; driver destruction runs after releasing the spares mutex.
++    fn retain_command_pool(&self, device: &DeviceShared, pool: CommandPool) -> bool {
++        let retained;
++        let past = {
++            let mut pools = lock(&self.command_pools);
++            let buffers =
++                pool.made.iter().map(Vec::len).sum::<usize>() + usize::from(pool.begun.is_some());
++            if cfg!(target_os = "ios") && buffers > COMMAND_BUFFERS_PER_POOL {
++                retained = false;
++                Some(pool.raw)
++            } else {
++                let past = if cfg!(target_os = "ios")
++                    && pools
++                        .iter()
++                        .filter(|spare| spare.family == pool.family)
++                        .count()
++                        >= COMMAND_POOLS_PER_FAMILY
++                {
++                    let oldest = pools
++                        .iter()
++                        .position(|spare| spare.family == pool.family)
++                        .expect("the full family has an idle pool");
++                    Some(pools.remove(oldest).raw)
++                } else {
++                    None
++                };
++                keep_command_pool(&mut pools, pool);
++                retained = true;
++                past
++            }
++        };
++
++        if let Some(raw) = past {
++            // SAFETY: the returned pool or an idle spare is exclusively held and has no pending work.
++            unsafe { release_in_section(device, raw) };
++        }
++
++        retained
++    }
++
+     /// A spare descriptor pool of `device`, reset, with room for one set of `needs`, the newest
+     /// such: a command buffer's arena's, or, for a fitted arena (`fitted`, the most descriptors
+     /// it takes a spare of), one of the fitted arenas' own; `None` when there is none, or this

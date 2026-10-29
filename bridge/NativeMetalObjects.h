@@ -76,9 +76,12 @@ void *nmb_buffer_contents(const NmbBuffer *);
 uint64_t nmb_buffer_length(const NmbBuffer *);
 bool nmb_buffer_did_modify_range(const NmbBuffer *, uint64_t offset, uint64_t length);
 uint64_t nmb_buffer_gpu_address(const NmbBuffer *);
+/* Imported address ranges inspected and mappings changed since device creation. */
+bool nmb_no_copy_remaps(uint64_t out[2]);
 
 struct NmbTextureDescriptor {
     uint64_t type, format, width, height, depth, levels, samples, array_length, usage, options;
+    uint64_t rotation, framebuffer_only, is_drawable;
 };
 /* Heaps: type 0 automatic / 1 placement; offset UINT64_MAX asks an automatic heap to place the resource. */
 NmbHeap *nmb_heap_new(NmbDevice *, uint64_t type, uint64_t size, uint64_t options);
@@ -90,6 +93,9 @@ uint64_t nmb_heap_max_available_size(const NmbHeap *, uint64_t alignment);
 uint64_t nmb_heap_set_purgeable_state(const NmbHeap *, uint64_t state);
 NmbBuffer *nmb_heap_new_buffer(const NmbHeap *, uint64_t length, uint64_t options, uint64_t offset);
 NmbTexture *nmb_heap_new_texture(const NmbHeap *, const struct NmbTextureDescriptor *, uint64_t offset);
+/* Size in bytes and required alignment, using the device's actual heap allocation layout. */
+bool nmb_device_heap_texture_size_and_align(const NmbDevice *, const struct NmbTextureDescriptor *, uint64_t out[2]);
+bool nmb_device_heap_buffer_size_and_align(const NmbDevice *, uint64_t length, uint64_t options, uint64_t out[2]);
 NmbTexture *nmb_texture_new(NmbDevice *, const struct NmbTextureDescriptor *);
 /* A linear texture over a buffer's bytes; iosurface marks the buffer as standing for a surface without planes (Metal's IOSurface rules). */
 NmbTexture *nmb_texture_new_on_buffer(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, bool iosurface);
@@ -194,6 +200,8 @@ int nmb_command_buffer_wait(NmbCommandBuffer *, uint64_t timeout_ms);
 /* Metal's MTLCommandBufferStatus (0 not enqueued .. 4 completed, 5 error). */
 uint64_t nmb_command_buffer_status(const NmbCommandBuffer *);
 size_t nmb_command_buffer_error(const NmbCommandBuffer *, char *out, size_t size);
+/* Metal's error code, or zero for a failure originating in translation. */
+uint64_t nmb_command_buffer_metal_error_code(const NmbCommandBuffer *);
 double nmb_command_buffer_gpu_time(const NmbCommandBuffer *, bool end);
 
 /* Events: an MTLEvent (shared false) or an MTLSharedEvent within this process. */

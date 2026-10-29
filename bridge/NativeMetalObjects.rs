@@ -19,7 +19,7 @@ use metal2vulkan::pipeline::{
 use metal2vulkan_runtime::{
     BinaryArchive, BinaryArchiveDescriptor, BlitCommandEncoder, FamilyRow, FeatureRow, GpuFamily, RowState, BlitOption, Buffer, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
     ComputePipelineState, Deallocator, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction,
-    MetalLevel, Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions, ResourceRef,
+    Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions, ResourceRef,
     SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
 };
 use std::cell::RefCell;
@@ -27,6 +27,7 @@ use std::ffi::{c_char, c_void, CStr};
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::time::Duration;
+use metal2vulkan_runtime::FailureOrigin;
 
 thread_local! {
     static LAST: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -140,7 +141,7 @@ pub unsafe extern "C" fn nmb_function_constant_air(length: *mut usize) -> *const
 
 // ---- device ----
 
-pub struct NmbDevice(Device, std::sync::OnceLock<PrivateProperties>, std::sync::Mutex<()>);
+pub struct NmbDevice(Device, std::sync::OnceLock<PrivateProperties>, std::sync::Mutex<NoCopyPages>);
 
 impl NmbDevice {
     /// The runtime judges the private properties by the family rows once.
@@ -161,13 +162,19 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         let (loader, cache) = unsafe { (CStr::from_ptr(loader), CStr::from_ptr(cache)) };
         let mut options = DeviceOptions::default();
         options.loader = Some(PathBuf::from(loader.to_string_lossy().into_owned()));
-        options.metal_level = Some(MetalLevel::NEWEST);
         options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache.to_string_lossy().into_owned());
         options.messages = Some(MessageSink::new(observe_message));
         // The window server's textures keep no data between padded rows, so render targets
         // and writable textures can use images over their backing buffers at the existing row pitch.
-        options.policy.padded_reads = metal2vulkan::device::PaddedReadsPolicy::AliasWrites;
-        Ok(boxed(NmbDevice(Device::system_default_with(&options).map_err(e("device"))?, std::sync::OnceLock::new(), std::sync::Mutex::new(()))))
+        options.policy.host_page_textures = metal2vulkan::device::HostPageTexturePolicy::InPlaceWrites;
+        options.policy.pipeline_waits = metal2vulkan::device::PipelineWaitPolicy::Exact;
+
+        let device = Device::system_default_with(&options).map_err(e("device"))?;
+        // The frontend keeps each imported allocation mapped until its runtime owner releases it.
+        // Commands therefore retain their existing resources without recording calls for rebinding.
+        device.refuse_rebinds();
+
+        Ok(boxed(NmbDevice(device, std::sync::OnceLock::new(), std::sync::Mutex::default())))
     })
 }
 
@@ -608,12 +615,107 @@ pub unsafe extern "C" fn nmb_buffer_new_no_copy_releasing(device: *mut NmbDevice
     unsafe { no_copy(device, pointer, length, options_word, deallocator) }
 }
 
+/// NoCopyPages records the VM objects and offsets behind each imported address range.
+/// The device's no-copy mutex covers both this table and import creation. When the
+/// mapping changes, the bridge tells the runtime before it imports the new pages.
+#[derive(Default)]
+pub struct NoCopyPages {
+    seen: std::collections::HashMap<(u64, u64), u64>,
+    /// A cleared table may omit ranges whose runtime imports are still alive.
+    forgot: bool,
+}
+
+const NO_COPY_RANGES_NOTED: usize = 8192;
+static NO_COPY_REMAPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Reads the leaf VM object identity and offset across the supplied address range.
+/// A missing object or unmapped interval asks the caller to discard any older import match.
+#[cfg(target_vendor = "apple")]
+fn pages_identity(start: u64, length: u64) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+
+    /// Region matches Darwin's vm_region_submap_short_info_64 layout.
+    #[repr(C, packed(4))]
+    #[derive(Default)]
+    struct Region {
+        protection: i32,
+        max_protection: i32,
+        inheritance: u32,
+        offset: u64,
+        user_tag: u32,
+        ref_count: u32,
+        shadow_depth: u16,
+        external_pager: u8,
+        share_mode: u8,
+        is_submap: i32,
+        behavior: i32,
+        object_id: u32,
+        user_wired_count: u16,
+    }
+
+    unsafe extern "C" {
+        static mach_task_self_: u32;
+        fn mach_vm_region_recurse(task: u32, address: *mut u64, size: *mut u64, depth: *mut u32, info: *mut i32, count: *mut u32) -> i32;
+    }
+
+    let end = start.checked_add(length)?;
+    let mut identity = std::collections::hash_map::DefaultHasher::new();
+    let mut at = start;
+    while at < end {
+        let (mut address, mut size, mut depth) = (at, 0u64, 64u32);
+        let mut region = Region::default();
+        let mut count = (std::mem::size_of::<Region>() / 4) as u32;
+        // SAFETY: the output arguments occupy this frame, including count words in region.
+        let status = unsafe {
+            mach_vm_region_recurse(mach_task_self_, &mut address, &mut size, &mut depth, (&raw mut region).cast(), &mut count)
+        };
+        let (object, offset) = (region.object_id, region.offset);
+        if status != 0 || address > at || object == 0 {
+            return None;
+        }
+
+        let next = address.checked_add(size)?;
+        if next <= at {
+            return None;
+        }
+
+        (at, object, offset.checked_add(at - address)?).hash(&mut identity);
+        at = next;
+    }
+
+    Some(identity.finish())
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn pages_identity(_: u64, _: u64) -> Option<u64> {
+    None
+}
+
+/// Returns the number of inspected no-copy ranges and changed mappings in two words.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_no_copy_remaps(out: *mut u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    if out.is_null() {
+        return false;
+    }
+
+    // SAFETY: the C ABI requires two writable words.
+    let out = unsafe { std::slice::from_raw_parts_mut(out, 2) };
+    out[0] = NO_COPY_REMAPS[0].load(Relaxed);
+    out[1] = NO_COPY_REMAPS[1].load(Relaxed);
+
+    true
+}
+
 unsafe fn no_copy(device: *mut NmbDevice, pointer: *mut c_void, length: u64, options_word: u64, deallocator: Option<Deallocator>)
                   -> *mut NmbBuffer {
     guard(std::ptr::null_mut(), || {
         let device = get(device)?;
         // SAFETY: the caller's contract.
-        let memory = unsafe { HostMemory::new(NonNull::new(pointer as *mut u8).ok_or("null memory")?) };
+        let base = NonNull::new(pointer as *mut u8).ok_or("null memory")?;
+        // SAFETY: the caller's contract.
+        let memory = unsafe { HostMemory::new(base) };
         let modes = options(options_word)?;
         // The runtime's live-import lookup and subsequent join are separate:
         // simultaneous first constructors can allocate distinct imports of the
@@ -624,9 +726,41 @@ unsafe fn no_copy(device: *mut NmbDevice, pointer: *mut c_void, length: u64, opt
         // returning/formatting a failure; GPU work and resource release never
         // take it. A device's unrelated APIs and other devices remain separate.
         let buffer = {
-            let _gate = device.2.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            use std::sync::atomic::Ordering::Relaxed;
+
+            let mut gate = device.2.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let range = (pointer as u64, length);
+            let now = pages_identity(range.0, range.1);
+            let changed = match gate.seen.get(&range) {
+                Some(&noted) => now != Some(noted),
+                None => gate.forgot || now.is_none(),
+            };
+
+            NO_COPY_REMAPS[0].fetch_add(1, Relaxed);
+            if changed {
+                NO_COPY_REMAPS[1].fetch_add(1, Relaxed);
+                device.0.host_range_remapped(base, length);
+            }
+
             // SAFETY: as above.
-            unsafe { device.0.new_buffer_with_bytes_no_copy(memory, length, modes, deallocator) }
+            let buffer = unsafe { device.0.new_buffer_with_bytes_no_copy(memory, length, modes, deallocator) };
+
+            // Wiring writable pages may create a new VM object for the range.
+            match (&buffer, pages_identity(range.0, range.1)) {
+                (Ok(_), Some(pages)) => {
+                    if gate.seen.len() >= NO_COPY_RANGES_NOTED && !gate.seen.contains_key(&range) {
+                        gate.seen.clear();
+                        gate.forgot = true;
+                    }
+
+                    gate.seen.insert(range, pages);
+                }
+                _ => {
+                    gate.seen.remove(&range);
+                }
+            }
+
+            buffer
         };
         Ok(boxed(NmbBuffer(buffer.map_err(e("no-copy buffer"))?)))
     })
@@ -739,6 +873,43 @@ pub extern "C" fn nmb_heap_new_texture(heap: *const NmbHeap, descriptor: *const 
     })
 }
 
+/// Returns the texture's required heap size and alignment in two writable words.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_heap_texture_size_and_align(device: *const NmbDevice, descriptor: *const NmbTextureDescriptor, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null heap size result".into());
+        }
+
+        let descriptor = texture_descriptor(descriptor)?;
+        let answer = get(device)?.0.heap_texture_size_and_align(&descriptor).map_err(e("heap texture size"))?;
+
+        // SAFETY: the C ABI requires two writable words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 2) };
+        (out[0], out[1]) = (answer.size, answer.align);
+
+        Ok(true)
+    })
+}
+
+/// Returns the buffer's required heap size and alignment in two writable words.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_heap_buffer_size_and_align(device: *const NmbDevice, length: u64, options_word: u64, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null heap size result".into());
+        }
+
+        let answer = get(device)?.0.heap_buffer_size_and_align(length, options(options_word)?);
+
+        // SAFETY: the C ABI requires two writable words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 2) };
+        (out[0], out[1]) = (answer.size, answer.align);
+
+        Ok(true)
+    })
+}
+
 // ---- textures ----
 
 #[repr(C)]
@@ -753,6 +924,9 @@ pub struct NmbTextureDescriptor {
     pub array_length: u64,
     pub usage: u64,
     pub options: u64,
+    pub rotation: u64,
+    pub framebuffer_only: u64,
+    pub is_drawable: u64,
 }
 
 pub struct NmbTexture(Texture);
@@ -770,6 +944,9 @@ fn texture_descriptor(d: *const NmbTextureDescriptor) -> Result<TextureDescripto
     out.array_length = d.array_length;
     out.usage = raw::<TextureUsage>(d.usage, "texture usage")?;
     out.resource_options = options(d.options)?;
+    out.rotation = d.rotation;
+    out.framebuffer_only = d.framebuffer_only != 0;
+    out.is_drawable = d.is_drawable != 0;
     Ok(out)
 }
 
@@ -887,6 +1064,9 @@ pub extern "C" fn nmb_texture_describe(texture: *const NmbTexture, out: *mut Nmb
             array_length: t.array_length(),
             usage: t.usage().as_raw() as u64,
             options: t.resource_options().raw(),
+            rotation: t.rotation(),
+            framebuffer_only: u64::from(t.framebuffer_only()),
+            is_drawable: u64::from(t.is_drawable()),
         };
         Ok(())
     })
@@ -1537,7 +1717,22 @@ pub extern "C" fn nmb_command_buffer_status(command_buffer: *const NmbCommandBuf
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_command_buffer_error(command_buffer: *const NmbCommandBuffer, out: *mut c_char, size: usize) -> usize {
-    guard(0, || Ok(get(command_buffer)?.0.error_description().map_or(0, |text| copy_out(&text, out, size))))
+    guard(0, || {
+        let command_buffer = &get(command_buffer)?.0;
+        let description = command_buffer.error_description()
+            .or_else(|| command_buffer.error().map(|error| format!("{error:?}")));
+
+        Ok(description.map_or(0, |text| copy_out(&text, out, size)))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_buffer_metal_error_code(command_buffer: *const NmbCommandBuffer) -> u64 {
+    guard(0, || {
+        Ok(get(command_buffer)?.0.error()
+            .filter(|error| error.origin() == FailureOrigin::Metal)
+            .map_or(0, |error| error.metal_code()))
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -1577,7 +1772,7 @@ fn shared<'a>(event: *const NmbEvent) -> Result<&'a SharedEvent, String> {
 /// forwards to it).
 fn listener() -> Result<&'static SharedEventListener, String> {
     static LISTENER: std::sync::OnceLock<Result<SharedEventListener, String>> = std::sync::OnceLock::new();
-    LISTENER.get_or_init(|| SharedEventListener::new().map_err(e("listener"))).as_ref().map_err(|why| why.clone())
+    LISTENER.get_or_init(|| Ok(SharedEventListener::new())).as_ref().map_err(|why: &String| why.clone())
 }
 
 #[unsafe(no_mangle)]

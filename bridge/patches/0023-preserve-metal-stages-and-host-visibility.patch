@@ -1,0 +1,1067 @@
+diff --git a/crates/metal2vulkan-runtime/src/batch_order.rs b/crates/metal2vulkan-runtime/src/batch_order.rs
+index 1fef7309..16039dc9 100644
+--- a/crates/metal2vulkan-runtime/src/batch_order.rs
++++ b/crates/metal2vulkan-runtime/src/batch_order.rs
+@@ -33,7 +33,7 @@
+ //! host imports, 67.0 command buffers submitted a frame against 129.3 to 129.7), and runs as the
+ //! driver ran it before. Elsewhere, and under `BatchOrderPolicy::Exact`, the exact form.
+ 
+-use crate::tracker::Barrier;
++use crate::tracker::{Access, Barrier};
+ use ash::vk;
+ use metal2vulkan::device::{BatchOrderPolicy, DevicePolicy};
+ use metal2vulkan::vk::DriverId;
+@@ -62,6 +62,15 @@ pub(crate) fn end(by_ends: bool) -> Barrier {
+     }
+ }
+ 
++/// The batch's device ordering, where enabled, or the writes its CPU consumers need to see.
++pub(crate) fn end_for_host_writes(by_ends: bool, writes: Access) -> Option<Barrier> {
++    if by_ends {
++        Some(end(true))
++    } else {
++        Barrier::to_host_from(writes)
++    }
++}
++
+ /// The stage a batch's start timestamp is written at where nothing is planned before it: the
+ /// top of the pipe, as its work begins, or, where batches are ordered `by_ends`, the bottom,
+ /// once everything before it completed.
+diff --git a/crates/metal2vulkan-runtime/src/buffer.rs b/crates/metal2vulkan-runtime/src/buffer.rs
+index 25cc2024..c095c78f 100644
+--- a/crates/metal2vulkan-runtime/src/buffer.rs
++++ b/crates/metal2vulkan-runtime/src/buffer.rs
+@@ -2292,7 +2292,9 @@ impl Device {
+             again,
+         } = parts;
+         let pages = self.pages_of(raw, memory, offset, base, reach);
+-        let identity = Identity::new(modes.hazard, of_heap);
++        let host_accessible = matches!(modes.storage, StorageMode::Shared | StorageMode::Managed)
++            || !matches!(owner, Owner::Runtime);
++        let identity = Identity::new_with_host_access(modes.hazard, of_heap, host_accessible);
+         let lie = match owner {
+             // A no-copy buffer's pages are its until a rebind (`rebind.rs`).
+             Owner::Caller => {
+@@ -2364,7 +2366,7 @@ impl Device {
+         (address, reserved): (GpuAddress, Held),
+         release: Option<Release>,
+     ) -> Buffer {
+-        let identity = Identity::new(modes.hazard, false);
++        let identity = Identity::new_with_host_access(modes.hazard, false, true);
+         let own = OwnBytes {
+             lie: self.host_lie(identity.key, import, release),
+             reserved,
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index 409a9db6..44107d84 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -1757,9 +1757,8 @@ impl Drop for CommandBufferShared {
+         // A command buffer that still holds its pool was never submitted, or ended before its
+         // completion gave the pool back: a committed command buffer is held by the scheduler until
+         // its batches were submitted, and by its queue's waiter until they completed, so
+-        // nothing of its pool is pending. The device's spares keep it (`spares.rs`), which
+-        // release it only with the device. A timestamp slot it still holds goes back with its
+-        // state.
++        // nothing of its pool is pending. The device's spares retain it within their iOS
++        // limits (`spares.rs`). A timestamp slot it still holds goes back with its state.
+         let pool = lock(&self.state).pool.take();
+         if let Some(pool) = pool {
+             let shared = self.device.shared();
+@@ -3829,12 +3828,21 @@ impl CommandBufferShared {
+         };
+         let device = self.device.shared().vk();
+         if fold {
++            let host_writes = state.recorded[state.batch_range(batch)]
++                .iter()
++                .fold(crate::tracker::Access::NONE, |writes, part| {
++                    writes.union(part.summary.host_writes())
++                });
++            let export =
++                crate::batch_order::end_for_host_writes(self.device.shared().by_ends, host_writes);
+             // SAFETY: the tail is recording, outside any render pass (its encoder's passes began
+             // and ended in its own recordings), and only this call records it, under the state
+             // lock; the slot's queries were reset by the batch's start, before it in submission
+             // order (`submit.rs`).
+             unsafe {
+-                crate::batch_order::end(self.device.shared().by_ends).record(device, raw);
++                if let Some(export) = export {
++                    export.record(device, raw);
++                }
+                 if let Some((queries, first)) = stamp {
+                     let bottom = vk::PipelineStageFlags::BOTTOM_OF_PIPE;
+                     device.cmd_write_timestamp(raw, bottom, queries, first + 1);
+@@ -4537,7 +4545,7 @@ impl CommandBufferShared {
+             submitted_holds = state.holds_until(usize::MAX);
+             // Its work ended (its fences were signaled, or its queues drained after a failed
+             // wait), so nothing of its pools is pending: its command pool goes to the device's
+-            // spares whatever its status, never released on this thread (`spares.rs`); its
++            // spares within their iOS limits, whatever its status (`spares.rs`); its
+             // descriptor pools go once its completed handlers ran (below).
+             if let Some(pool) = state.pool.take() {
+                 // None of the pool's command buffers is recording where it completed and ended
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+index 7b18eb69..e04b8e84 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+@@ -7,7 +7,7 @@
+ //!    `VkCommandBuffer`s (an encoder's segments among its own), each encoder after the barrier the
+ //!    tracker planned for it. What completed work wrote is made visible by a wait or a barrier,
+ //!    see below.
+-//! 2. The end: the barrier that makes every write visible to the host ([`Barrier::to_host`]), or,
++//! 2. The end: writes to CPU-consumed storage become host-visible ([`Barrier::to_host_from`]), or,
+ //!    where batches are ordered by their ends (`batch_order.rs`), to the host and to every later
+ //!    command of the `VkQueue` ([`Barrier::to_all`]; so a later batch there plans no barrier from
+ //!    this one's accesses, `tracker.rs`), then the signals: the events' kept signal indices, the
+@@ -196,7 +196,7 @@ use crate::sparse::encoder::SparseUpdate;
+ use crate::texture::decoded_twin::{SecondDecode, TwinWrite};
+ use crate::texture::wrapped::Transition;
+ use crate::texture::Texture;
+-use crate::tracker::{Barrier, EncoderUses, Point, Summary};
++use crate::tracker::{Access, Barrier, EncoderUses, Point, Summary};
+ use crate::work_counts::Begun;
+ use ash::vk;
+ use metal2vulkan::bind::ReplayFaults;
+@@ -443,7 +443,7 @@ impl CommandBufferShared {
+                 })?;
+                 let first = &mut state.recorded[range.start];
+                 first.raws.push(raw);
+-                first.summary.join(Summary::outside_encoders(uses));
++                first.summary.join(Summary::outside_resource_uses(uses));
+                 if !signalled {
+                     after_all = Some(scheduler.values.clone());
+                 }
+@@ -553,8 +553,8 @@ impl CommandBufferShared {
+         // writes until its submission was made (`heap_sets::hold`).
+         let firsts = &shared.textures.first_moves;
+         let first_work = firsts.take_holding(|_| true, || crate::heap_sets::hold(device));
+-        let entry = (!entries.is_empty()).then(|| Summary::outside_encoders(entry_uses));
+-        let exit = (!exits.is_empty()).then(|| Summary::outside_encoders(exit_uses));
++        let entry = (!entries.is_empty()).then(|| Summary::outside_resource_uses(entry_uses));
++        let exit = (!exits.is_empty()).then(|| Summary::outside_resource_uses(exit_uses));
+         // The held depths' moves before each encoder that names one, into the layout it needs
+         // (`texture/held_depth.rs`): writes the tracker plans with the encoder's uses, before
+         // them, so each waits for what came before it and orders what follows.
+@@ -573,7 +573,7 @@ impl CommandBufferShared {
+                     let uses = held_moves.uses(at);
+                     (!uses.is_empty()).then(|| {
+                         let mut summary = recorded.summary.clone();
+-                        summary.join(Summary::outside_encoders(uses.to_vec()));
++                        summary.join(Summary::outside_resource_uses(uses.to_vec()));
+                         summary
+                     })
+                 })
+@@ -583,6 +583,20 @@ impl CommandBufferShared {
+             let moved = moved.get(at).and_then(Option::as_ref);
+             moved.unwrap_or(&recorded.summary)
+         });
++        let (accesses, mut host_writes) = entry.iter().chain(summaries.clone()).chain(&exit).fold(
++            (Access::NONE, Access::NONE),
++            |(all, host), summary| {
++                (
++                    all.union(summary.accesses()),
++                    host.union(summary.host_writes()),
++                )
++            },
++        );
++        // Initialization and staged host transfers also record copies outside these summaries.
++        let internal_exports = first_work.has_first() || first_work.has_staged();
++        if internal_exports {
++            host_writes = host_writes.union(Barrier::to_host().src);
++        }
+         let plan = scheduler
+             .tracker
+             .plan(entry.iter().chain(summaries).chain(&exit), at);
+@@ -602,7 +616,9 @@ impl CommandBufferShared {
+         // of barriers makes what completed work wrote visible, in place of the work's waits (the
+         // module docs).
+         let by_barrier = shared.completed_by_barrier;
+-        let mut completed_barrier = by_barrier.then(Barrier::after_completed);
++        let mut completed_barrier = by_barrier
++            .then(|| Barrier::after_completed_for(accesses))
++            .flatten();
+         // The first encoder's prefix wrote the start where the batch plans nothing before that
+         // encoder (no barrier, no image moved, no barrier for completed work) and its first
+         // command buffer goes to the queue as recorded (`gpu_time.rs`): then no command buffer of
+@@ -818,19 +834,32 @@ impl CommandBufferShared {
+         // An event's kept signal that waits for another `VkQueue`'s earlier one goes after that
+         // wait, in an end of its own (the module docs): the end the work holds made its writes
+         // visible and wrote its end timestamp, so that one records the barrier alone.
+-        let folded = in_work && order_semaphores.is_empty();
+-        // The end, where the batch has something to end. A batch with no work, no wait, no image
+-        // to move back and no timestamp records none: none of its commands wrote anything, every
+-        // batch before it on any `VkQueue` made its own writes visible to the host before its
+-        // signals, and its signals follow every command submitted before them. A wait needs it:
+-        // a wait orders the commands of its batch, and a signal follows those, not the wait.
++        let folded = in_work && order_semaphores.is_empty() && !internal_exports;
++        // A folded end already exported its encoder writes. Copies added by the submission
++        // need their own export, and a wait without an export needs an execution dependency.
+         let stamps = Stamps {
+             start: start_stamp.take(),
+             after: false,
+             end: slot.filter(|_| last && !in_work),
+         };
+-        let ends = !single
+-            || !order_semaphores.is_empty()
++        let host_barrier = if in_work && !internal_exports {
++            None
++        } else {
++            crate::batch_order::end_for_host_writes(shared.by_ends, host_writes)
++        };
++        let wait_barrier =
++            (!order_semaphores.is_empty() && host_barrier.is_none()).then_some(Barrier {
++                src: Access::new(
++                    vk::PipelineStageFlags2::ALL_COMMANDS,
++                    vk::AccessFlags2::NONE,
++                ),
++                dst: Access::new(
++                    vk::PipelineStageFlags2::ALL_COMMANDS,
++                    vk::AccessFlags2::NONE,
++                ),
++            });
++        let ends = host_barrier.is_some()
++            || wait_barrier.is_some()
+             || exit_barrier.is_some()
+             || !exits.is_empty()
+             || stamps.start.is_some()
+@@ -839,7 +868,8 @@ impl CommandBufferShared {
+             true => {
+                 let finale_barriers: Vec<Barrier> = exit_barrier
+                     .into_iter()
+-                    .chain([crate::batch_order::end(shared.by_ends)])
++                    .chain(host_barrier)
++                    .chain(wait_barrier)
+                     .collect();
+                 let kept = &mut scheduler.kept;
+                 vec![self.barrier_buffer(&mut state, kept, at, &finale_barriers, &exits, stamps)?]
+@@ -1021,6 +1051,11 @@ impl CommandBufferShared {
+         let handlers = (schedules && !state.submission.is_empty()) || forms;
+         state.submitting = handlers;
+         scheduler.tracker.apply(plan);
++        shared.counts.submission_accesses(
++            end - start + usize::from(entry.is_some()) + usize::from(exit.is_some()),
++            accesses,
++            host_writes,
++        );
+         held_moves.submitted();
+         shared.counts.held_depths_released(held_moves.released);
+         let several = shared.queues.len() > 1;
+@@ -1244,7 +1279,7 @@ impl CommandBufferShared {
+             first.raws.insert(0, raw);
+             first
+                 .summary
+-                .join(Summary::outside_encoders(uses.collect()));
++                .join(Summary::outside_resource_uses(uses.collect()));
+             counts.second_twin_decodes(queued.len());
+             state.retained.push(Box::new(queued));
+         }
+@@ -1271,7 +1306,7 @@ impl CommandBufferShared {
+             recorded.raws.push(raw);
+             recorded
+                 .summary
+-                .join(Summary::outside_encoders(uses.collect()));
++                .join(Summary::outside_resource_uses(uses.collect()));
+             counts.second_twin_decodes(decodes.len());
+             state.retained.push(Box::new(decodes));
+         }
+diff --git a/crates/metal2vulkan-runtime/src/compute.rs b/crates/metal2vulkan-runtime/src/compute.rs
+index dc564fe9..ed96c5f5 100644
+--- a/crates/metal2vulkan-runtime/src/compute.rs
++++ b/crates/metal2vulkan-runtime/src/compute.rs
+@@ -1157,6 +1157,11 @@ impl ComputeCommandEncoder {
+     /// it adds nothing Metal would not do.
+     pub fn memory_barrier_with_scope(&mut self, scope: BarrierScope) {
+         self.log(|_| ComputeCall::BarrierWithScope(scope));
++        self.core.device().shared().counts.scope_barrier();
++        if self.dispatch_type == DispatchType::Serial {
++            self.core.device().shared().counts.serial_barrier_elided();
++            return;
++        }
+         if !scope.intersects(BarrierScope::BUFFERS.union(BarrierScope::TEXTURES)) {
+             return;
+         }
+@@ -1204,6 +1209,11 @@ impl ComputeCommandEncoder {
+         for resource in resources {
+             self.core.check_device(call, resource.device())?;
+         }
++        self.core
++            .device()
++            .shared()
++            .counts
++            .resources_declared(resources.len());
+         if resources.iter().any(ResourceRef::is_memoryless) {
+             self.core.fail_memoryless_use();
+             return Ok(());
+diff --git a/crates/metal2vulkan-runtime/src/encoder.rs b/crates/metal2vulkan-runtime/src/encoder.rs
+index 3fb1e61b..45b81705 100644
+--- a/crates/metal2vulkan-runtime/src/encoder.rs
++++ b/crates/metal2vulkan-runtime/src/encoder.rs
+@@ -359,6 +359,27 @@ pub(super) struct ReplayedPart {
+     pub(super) segments: Vec<Segment>,
+ }
+ 
++/// Accumulate writes to CPU-consumed storage after a command's host aliases have been added.
++fn record_host_writes(
++    recorded: &mut EncoderUses<ResourceKey>,
++    uses: &[Use<ResourceKey>],
++    device: &Device,
++) {
++    let mut writes = crate::tracker::Access::NONE;
++    let (mut host, mut private) = (0, 0);
++    for used in uses.iter().filter(|used| !used.write.is_empty()) {
++        if used.key.host_accessible() {
++            writes = writes.union(used.write);
++            host += 1;
++        } else {
++            private += 1;
++        }
++    }
++
++    recorded.record_host_writes(writes);
++    device.shared().counts.host_write_uses(host, private);
++}
++
+ /// An ended encoder's `VkCommandBuffer`s `raws`, in order, and its `segments`, in parts: a segment
+ /// the GPU may write what it reads for starts a part of its own (the module's segments), each
+ /// segment's place counted among its part's `VkCommandBuffer`s, and its place among the
+@@ -1118,6 +1139,7 @@ impl EncoderCore {
+         self.open.command_buffer.note_dirty(tracked);
+         let barrier = self.uses.barrier(tracked, reach);
+         self.uses.record_reaching(stages, tracked, barrier, reach);
++        record_host_writes(&mut self.uses, tracked, self.open.command_buffer.device());
+         if barrier.is_some() {
+             self.device().shared().counts.command_barrier();
+         }
+@@ -1380,6 +1402,7 @@ impl EncoderCore {
+         };
+         self.open.command_buffer.note_dirty(all);
+         self.uses.record(stages, all, None);
++        record_host_writes(&mut self.uses, all, self.open.command_buffer.device());
+     }
+ 
+     /// The copies a command that uses the shadowed textures `shadows` and has `uses` needs
+@@ -1714,6 +1737,7 @@ impl EncoderCore {
+         record(self.device().shared().vk(), raw);
+         self.open.command_buffer.note_dirty(tracked);
+         self.uses.record(stages, tracked, None);
++        record_host_writes(&mut self.uses, tracked, self.open.command_buffer.device());
+         self.touch(uses);
+     }
+ 
+@@ -1785,6 +1809,7 @@ impl EncoderCore {
+             let stages = copy.stages_with(rows.as_ref());
+             self.open.command_buffer.note_dirty(tracked);
+             self.uses.record(stages, tracked, None);
++            record_host_writes(&mut self.uses, tracked, self.open.command_buffer.device());
+             self.touch(&uses);
+             if let Some(sets) = rows.and_then(RowCopies::retained) {
+                 self.retain(sets);
+diff --git a/crates/metal2vulkan-runtime/src/fence.rs b/crates/metal2vulkan-runtime/src/fence.rs
+index b041a8a0..a8b2384f 100644
+--- a/crates/metal2vulkan-runtime/src/fence.rs
++++ b/crates/metal2vulkan-runtime/src/fence.rs
+@@ -68,7 +68,7 @@ use super::render::RenderLowering;
+ use super::render::{FRAGMENT_DRAW_STAGES, GEOMETRY_DRAW_STAGES};
+ use super::replay::{BlitCall, ComputeCall, Resource};
+ use super::resource::{ResourceKey, ResourceRef};
+-use super::tracker::Barrier;
++use super::tracker::{Access, Barrier};
+ use ash::vk;
+ use metal2vulkan::metal::{BarrierScope, RenderStages};
+ use std::sync::{Arc, Mutex};
+@@ -149,6 +149,7 @@ impl EncoderCore {
+         draws: Option<vk::PipelineStageFlags2>,
+     ) -> Result<(), Error> {
+         self.check_device(call, fence.device())?;
++        self.device().shared().counts.fence_updated();
+         self.uses().update_fence(fence.0.key, draws);
+         Ok(())
+     }
+@@ -164,6 +165,7 @@ impl EncoderCore {
+         draws: Option<vk::PipelineStageFlags2>,
+     ) -> Result<(), Error> {
+         self.check_device(call, fence.device())?;
++        self.device().shared().counts.fence_waited();
+         self.uses().wait_for_fence(fence.0.key, draws);
+         // Metal shows the work the wait orders after it the bytes the update's writer left, so
+         // no shadowed texture's image is carried on (`shadow::ShadowCarry`).
+@@ -190,6 +192,11 @@ impl ComputeCommandEncoder {
+                 for resource in resources {
+                     core.check_device(CALL, resource.device())?;
+                 }
++                core.device().shared().counts.resource_barrier();
++                if core.uses().ordered() {
++                    core.device().shared().counts.serial_barrier_elided();
++                    return Ok(());
++                }
+                 if !resources.is_empty() {
+                     core.barrier(Barrier::between_dispatches());
+                     this.capture(|| Event::Barrier);
+@@ -339,6 +346,7 @@ impl RenderLowering {
+         before_stages: RenderStages,
+     ) {
+         self.log(|_| RenderCall::BarrierWithScope(scope, after_stages, before_stages));
++        self.core().device().shared().counts.scope_barrier();
+         if scope.is_empty() || after_stages.is_empty() || before_stages.is_empty() {
+             return;
+         }
+@@ -350,7 +358,7 @@ impl RenderLowering {
+             }
+             return;
+         }
+-        self.barrier_before_next_draw();
++        self.barrier_before_next_draw_with(render_barrier(after_stages, before_stages));
+     }
+ 
+     /// The lowering of [`RenderCommandEncoder::memory_barrier_with_resources`].
+@@ -364,16 +372,51 @@ impl RenderLowering {
+             RenderCall::BarrierWithResources(Resource::all(resources), after_stages, before_stages)
+         });
+         const CALL: &str = "memory_barrier_with_resources";
++        self.core().device().shared().counts.resource_barrier();
+         for resource in resources {
+             self.core().check_device(CALL, resource.device())?;
+         }
+         if !resources.is_empty() && !after_stages.is_empty() && !before_stages.is_empty() {
+-            self.barrier_before_next_draw();
++            self.barrier_before_next_draw_with(render_barrier(after_stages, before_stages));
+         }
+         Ok(())
+     }
+ }
+ 
++/// The stages that execute a render operation and the copies or dispatches generated for it.
++fn render_stages(stages: RenderStages) -> vk::PipelineStageFlags2 {
++    let mut result =
++        vk::PipelineStageFlags2::ALL_TRANSFER | vk::PipelineStageFlags2::COMPUTE_SHADER;
++    if stages.contains(RenderStages::VERTEX) {
++        result |= VERTEX_DRAW_STAGES;
++    }
++    if stages.intersects(RenderStages::FRAGMENT | RenderStages::TILE) {
++        result |= FRAGMENT_DRAW_STAGES;
++    }
++    if stages.contains(RenderStages::OBJECT) {
++        result |= vk::PipelineStageFlags2::DRAW_INDIRECT | vk::PipelineStageFlags2::TASK_SHADER_EXT;
++    }
++    if stages.contains(RenderStages::MESH) {
++        result |= vk::PipelineStageFlags2::DRAW_INDIRECT | vk::PipelineStageFlags2::MESH_SHADER_EXT;
++    }
++    result
++}
++
++/// The explicit render dependency, including attachment stores and loads around the split.
++fn render_barrier(after: RenderStages, before: RenderStages) -> Barrier {
++    let attachments = super::render_target::ATTACHMENT_STAGES;
++    Barrier {
++        src: Access::new(
++            render_stages(after) | attachments,
++            vk::AccessFlags2::MEMORY_WRITE,
++        ),
++        dst: Access::new(
++            render_stages(before) | attachments,
++            vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
++        ),
++    }
++}
++
+ impl RenderCommandEncoder {
+     /// `updateFence:afterStages:`: the fence is updated after the encoder's draws' work in
+     /// `after_stages` and every stage before them (the module docs), and its work outside its
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index 8495e82f..cd2edc94 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -1493,6 +1493,10 @@ pub(crate) struct RenderLowering {
+     /// and copied in again (`linear_merge.rs`), so a draw after the barrier reads what the
+     /// pass drew.
+     reload_at: BTreeSet<usize>,
++    /// The dependency accumulated for the next explicit split between draws.
++    next_barrier: Option<Barrier>,
++    /// Explicit dependencies before same-shaped instances, indexed among all pass instances.
++    instance_barriers: BTreeMap<usize, Barrier>,
+     /// The pass has a draw call, whether or not it draws anything, an execution of render
+     /// commands or a tile dispatch: a `Clear` load clears over whole tiles (`clear_reach.rs`).
+     called: bool,
+@@ -2024,6 +2028,8 @@ impl RenderLowering {
+             barrier_inside: false,
+             reaches_unnamed: false,
+             reload_at: BTreeSet::new(),
++            next_barrier: None,
++            instance_barriers: BTreeMap::new(),
+             called: false,
+             depth_writes: false,
+             drew_depth_writes: false,
+@@ -4006,6 +4012,7 @@ impl RenderLowering {
+             residency,
+             extended,
+             reload_at,
++            instance_barriers,
+             log,
+             depth_writes,
+             drew_depth_writes,
+@@ -5217,6 +5224,7 @@ impl RenderLowering {
+             instances: instance_steps,
+             family: core.queue_flags(),
+             reload_at,
++            barriers: instance_barriers,
+             reloads: merged.iter().map(|(_, merge)| Arc::clone(merge)).collect(),
+             published,
+             texel_copies: later_texel_copies,
+@@ -5309,7 +5317,7 @@ impl RenderLowering {
+                         {
+                             // Each instance after the first sees everything the one before wrote.
+                             if index > 0 {
+-                                Barrier::everything().record(raw, command_buffer);
++                                steps.barrier_before(index).record(raw, command_buffer);
+                             }
+                             steps.before(raw, command_buffer, index);
+                             steps.begin(raw, command_buffer, index, pass.raw, framebuffer.raw);
+@@ -6337,6 +6345,7 @@ impl RenderLowering {
+                 instance.rerecord = None;
+             }
+             if split {
++                let same_shape = self.current.shape == instance.shape;
+                 let cause = match (self.barrier, self.dispatched) {
+                     (true, _) => Split::Barrier,
+                     (false, true) => Split::TileDispatch,
+@@ -6348,6 +6357,11 @@ impl RenderLowering {
+                 self.barrier_splits += usize::from(self.barrier);
+                 if self.barrier {
+                     self.reload_at.insert(self.earlier.len());
++                    if same_shape {
++                        if let Some(barrier) = self.next_barrier {
++                            self.instance_barriers.insert(self.earlier.len(), barrier);
++                        }
++                    }
+                 }
+             } else {
+                 // It takes the place of the current one, whose draws it records again.
+@@ -6358,6 +6372,7 @@ impl RenderLowering {
+             }
+             self.dispatched = false;
+             self.barrier = false;
++            self.next_barrier = None;
+         }
+     }
+ 
+@@ -6395,8 +6410,20 @@ impl RenderLowering {
+     /// or query recorded into the current instance, the next draw records into a new one, after
+     /// a barrier from everything before. Earlier instances are behind such a barrier already.
+     pub(super) fn barrier_before_next_draw(&mut self) {
++        self.barrier_before_next_draw_with(Barrier::everything());
++    }
++
++    /// Accumulate an explicit dependency for the next instance while retaining its copy steps.
++    pub(super) fn barrier_before_next_draw_with(&mut self, barrier: Barrier) {
+         self.barrier_inside = true;
+         self.barrier |= self.current.recorded;
++        self.next_barrier = Some(match self.next_barrier {
++            Some(previous) => Barrier {
++                src: previous.src.union(barrier.src),
++                dst: previous.dst.union(barrier.dst),
++            },
++            None => barrier,
++        });
+         self.unordered.clear();
+         self.barriered = true;
+     }
+diff --git a/crates/metal2vulkan-runtime/src/render/arguments.rs b/crates/metal2vulkan-runtime/src/render/arguments.rs
+index 8c17d3ea..e7826812 100644
+--- a/crates/metal2vulkan-runtime/src/render/arguments.rs
++++ b/crates/metal2vulkan-runtime/src/render/arguments.rs
+@@ -68,6 +68,11 @@ impl RenderLowering {
+         for resource in resources {
+             self.core.check_device(call, resource.device())?;
+         }
++        self.core
++            .device()
++            .shared()
++            .counts
++            .resources_declared(resources.len());
+         // A memoryless texture fails the command buffer from the pass on, with no draw after it
+         // too (`RenderCommandEncoder::use_resource`).
+         if resources.iter().any(ResourceRef::is_memoryless) {
+diff --git a/crates/metal2vulkan-runtime/src/render/executions.rs b/crates/metal2vulkan-runtime/src/render/executions.rs
+index 6eb8b140..774c4a6b 100644
+--- a/crates/metal2vulkan-runtime/src/render/executions.rs
++++ b/crates/metal2vulkan-runtime/src/render/executions.rs
+@@ -2411,6 +2411,8 @@ impl RenderExecution {
+             barrier_inside: false,
+             reaches_unnamed: true,
+             reload_at: std::collections::BTreeSet::new(),
++            next_barrier: None,
++            instance_barriers: std::collections::BTreeMap::new(),
+             called: true,
+             depth_writes: false,
+             drew_depth_writes: false,
+@@ -3281,7 +3283,11 @@ impl DeferredPass {
+                     let (shadowed, run_steps, before) = around;
+                     // Each instance after the first sees everything the one before wrote.
+                     if index > 0 {
+-                        Barrier::everything().record(raw, cb);
++                        let barrier = match run_index {
++                            0 => steps.barrier_before(at + first),
++                            _ => Barrier::everything(),
++                        };
++                        barrier.record(raw, cb);
+                     }
+                     // Its steps before its first run, and after its last (`render/pass_steps.rs`).
+                     if run_index == 0 {
+diff --git a/crates/metal2vulkan-runtime/src/render/inline_splits.rs b/crates/metal2vulkan-runtime/src/render/inline_splits.rs
+index cd18501f..dd1829d6 100644
+--- a/crates/metal2vulkan-runtime/src/render/inline_splits.rs
++++ b/crates/metal2vulkan-runtime/src/render/inline_splits.rs
+@@ -394,8 +394,20 @@ impl RenderLowering {
+         let waiting = |instance: &Instance| instance.kept.is_some() && !instance.planned;
+         if waiting(&self.current) {
+             let copies = self.plan_one(None)?;
++            let barrier = self
++                .instance_barriers
++                .get(&self.earlier.len())
++                .copied()
++                .unwrap_or_else(Barrier::everything);
+             let bound = &mut self.held_bound;
+-            record_kept(&mut self.core, bound, &self.current, &copies, &self.layout);
++            record_kept(
++                &mut self.core,
++                bound,
++                &self.current,
++                &copies,
++                &self.layout,
++                barrier,
++            );
+             self.current.planned = true;
+             return Ok(());
+         }
+@@ -463,8 +475,20 @@ impl RenderLowering {
+             // before the pass's, as the pass's end records them before its first instance.
+             self.core.shadow_copies(copies);
+         } else {
++            let barrier = self
++                .instance_barriers
++                .get(&at)
++                .copied()
++                .unwrap_or_else(Barrier::everything);
+             let (bound, instance) = (&mut self.held_bound, &self.earlier[at]);
+-            record_kept(&mut self.core, bound, instance, copies, &self.layout);
++            record_kept(
++                &mut self.core,
++                bound,
++                instance,
++                copies,
++                &self.layout,
++                barrier,
++            );
+         }
+         self.earlier[at].planned = true;
+     }
+@@ -529,6 +553,7 @@ fn record_kept(
+     instance: &Instance,
+     copies: &[ShadowCopy],
+     layout: &PassLayout,
++    barrier: Barrier,
+ ) {
+     let (Some(held), Some(kept)) = (core.held_pass(), instance.kept.as_ref()) else {
+         return;
+@@ -541,7 +566,7 @@ fn record_kept(
+     // one, and only this encoder records it.
+     unsafe {
+         raw.cmd_end_render_pass(held);
+-        Barrier::everything().record(raw, held);
++        barrier.record(raw, held);
+     }
+     core.held_shadow_copies(copies);
+     if let Some(clears) = &kept.clears {
+diff --git a/crates/metal2vulkan-runtime/src/render/pass_steps.rs b/crates/metal2vulkan-runtime/src/render/pass_steps.rs
+index 61e2f403..b18876b0 100644
+--- a/crates/metal2vulkan-runtime/src/render/pass_steps.rs
++++ b/crates/metal2vulkan-runtime/src/render/pass_steps.rs
+@@ -113,6 +113,8 @@ pub(super) struct PassSteps {
+     /// colors over a buffer's bytes rendered through copied stand-ins are merged back and copied
+     /// in again (`reloads`), and those the pass does not load are copied back (`published`).
+     pub(super) reload_at: std::collections::BTreeSet<usize>,
++    /// Explicit memory dependencies before instances with the same attachment shape.
++    pub(super) barriers: std::collections::BTreeMap<usize, Barrier>,
+     pub(super) reloads: Vec<std::sync::Arc<crate::linear_merge::LinearMerge>>,
+     pub(super) published: Option<StandInCopies>,
+     /// The shadowed textures' copies before each instance past the first, in order.
+@@ -136,6 +138,13 @@ pub(super) struct PassSteps {
+ }
+ 
+ impl PassSteps {
++    pub(super) fn barrier_before(&self, instance: usize) -> Barrier {
++        self.barriers
++            .get(&instance)
++            .copied()
++            .unwrap_or_else(Barrier::everything)
++    }
++
+     /// Record what goes before instance `index` (the module docs), after the barrier that
+     /// orders it after the instance before.
+     ///
+diff --git a/crates/metal2vulkan-runtime/src/resource.rs b/crates/metal2vulkan-runtime/src/resource.rs
+index 9ca10936..0c136e4b 100644
+--- a/crates/metal2vulkan-runtime/src/resource.rs
++++ b/crates/metal2vulkan-runtime/src/resource.rs
+@@ -6,15 +6,26 @@ use super::values::{HazardTrackingMode, StorageMode};
+ use super::{Buffer, Device, IndirectCommandBuffer, Texture};
+ use std::sync::atomic::{AtomicU64, Ordering};
+ 
+-/// A resource's key: unique in the process, never reused.
++/// A resource's key: unique in the process, never reused. Bit 0 records whether its backing
++/// has a CPU consumer; aliases copy the whole key with that allocation property.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+ pub(super) struct ResourceKey(u64);
+ 
+ impl ResourceKey {
+     /// A key no resource had before.
+     pub(super) fn new() -> ResourceKey {
+-        static NEXT: AtomicU64 = AtomicU64::new(1);
+-        ResourceKey(NEXT.fetch_add(1, Ordering::Relaxed))
++        Self::new_with_host_access(false)
++    }
++
++    /// Allocate a new storage identity with the caller's CPU-consumer requirement.
++    pub(super) fn new_with_host_access(host_accessible: bool) -> ResourceKey {
++        static NEXT: AtomicU64 = AtomicU64::new(2);
++        ResourceKey(NEXT.fetch_add(2, Ordering::Relaxed) | u64::from(host_accessible))
++    }
++
++    /// Whether writes to this storage must be visible to its CPU consumer at completion.
++    pub(super) fn host_accessible(self) -> bool {
++        self.0 & 1 != 0
+     }
+ }
+ 
+@@ -54,13 +65,22 @@ impl Identity {
+     /// A new resource's identity for its hazard tracking `mode`: `Default` is tracked for a
+     /// resource made outside a heap and untracked for one made in a heap, as in Metal.
+     pub(super) fn new(mode: HazardTrackingMode, in_heap: bool) -> Identity {
++        Self::new_with_host_access(mode, in_heap, false)
++    }
++
++    /// Resolve Metal hazard tracking and record whether the allocation has a CPU consumer.
++    pub(super) fn new_with_host_access(
++        mode: HazardTrackingMode,
++        in_heap: bool,
++        host_accessible: bool,
++    ) -> Identity {
+         let tracked = match mode {
+             HazardTrackingMode::Tracked => true,
+             HazardTrackingMode::Untracked => false,
+             HazardTrackingMode::Default => !in_heap,
+         };
+         Identity {
+-            key: ResourceKey::new(),
++            key: ResourceKey::new_with_host_access(host_accessible),
+             tracked,
+         }
+     }
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 8baf3ded..520dda74 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -2851,7 +2851,9 @@ impl Device {
+         descriptor: &TextureDescriptor,
+         hazard: HazardTrackingMode,
+     ) -> Result<Image, Error> {
+-        let identity = Identity::new(hazard, false);
++        let storage = descriptor.resource_options.storage_mode()?;
++        let host_accessible = matches!(storage, StorageMode::Shared | StorageMode::Managed);
++        let identity = Identity::new_with_host_access(hazard, false, host_accessible);
+         self.new_image_owned(plan, layout, descriptor, identity, Device::runtime_owner)
+     }
+ 
+@@ -2870,8 +2872,10 @@ impl Device {
+         descriptor: &TextureDescriptor,
+         hazard: HazardTrackingMode,
+     ) -> Result<Image, Error> {
+-        let identity = Identity::new(hazard, false);
+-        let held = descriptor.resource_options.storage_mode()? == StorageMode::Memoryless;
++        let storage = descriptor.resource_options.storage_mode()?;
++        let host_accessible = matches!(storage, StorageMode::Shared | StorageMode::Managed);
++        let identity = Identity::new_with_host_access(hazard, false, host_accessible);
++        let held = storage == StorageMode::Memoryless;
+         self.new_image_starting(
+             plan,
+             layout,
+diff --git a/crates/metal2vulkan-runtime/src/texture/heap.rs b/crates/metal2vulkan-runtime/src/texture/heap.rs
+index f33c13af..9e09e8ed 100644
+--- a/crates/metal2vulkan-runtime/src/texture/heap.rs
++++ b/crates/metal2vulkan-runtime/src/texture/heap.rs
+@@ -1869,7 +1869,9 @@ impl Device {
+         // last one finds no room (iPadOS 27's iconservicesagent: `heap texture: OutOfMemory(Heap)`).
+         // A shadow in Metal's tiles takes Metal's answer.
+         if (metal_answer.is_none() || past_metal.is_some()) && image.route != AliasRoute::Tiled {
+-            size_and_align.size = size_and_align.size.next_multiple_of(size_and_align.align.max(1));
++            size_and_align.size = size_and_align
++                .size
++                .next_multiple_of(size_and_align.align.max(1));
+         }
+         // Only a texture an image of binds into the heap's own memory is held to the heap's base,
+         // and the routes decide that (`holds_heap_base`).
+@@ -3192,7 +3194,10 @@ impl Device {
+             // `rebind.rs`, `detach.rs`); elsewhere a key of its own, as it shares no memory.
+             let key = match binding.host {
+                 true => bytes.identity().key,
+-                false => ResourceKey::new(),
++                false => ResourceKey::new_with_host_access(matches!(
++                    options.storage_mode()?,
++                    StorageMode::Shared | StorageMode::Managed
++                )),
+             };
+             let identity = Identity {
+                 key,
+diff --git a/crates/metal2vulkan-runtime/src/texture/wrapped.rs b/crates/metal2vulkan-runtime/src/texture/wrapped.rs
+index e9616d6c..246aee38 100644
+--- a/crates/metal2vulkan-runtime/src/texture/wrapped.rs
++++ b/crates/metal2vulkan-runtime/src/texture/wrapped.rs
+@@ -598,7 +598,7 @@ impl Device {
+         let plan = wrap_plan(plan, info, families, self.shared().sharing()).map_err(wrapped)?;
+         let aspects = image_aspects(plan.format);
+         check_layouts(layouts, info.usage.into(), aspects).map_err(wrapped)?;
+-        let identity = Identity::new(hazard, false);
++        let identity = Identity::new_with_host_access(hazard, false, true);
+         if layouts.moves() && !identity.tracked {
+             return Err(wrapped(WrappedImageProblem::Untracked));
+         }
+diff --git a/crates/metal2vulkan-runtime/src/tracker.rs b/crates/metal2vulkan-runtime/src/tracker.rs
+index 37ab4133..cabde8f9 100644
+--- a/crates/metal2vulkan-runtime/src/tracker.rs
++++ b/crates/metal2vulkan-runtime/src/tracker.rs
+@@ -337,6 +337,25 @@ pub(super) struct Barrier {
+ }
+ 
+ impl Barrier {
++    /// Visibility of completed GPU writes for the stages and accesses in the next batch.
++    pub(super) fn after_completed_for(dst: Access) -> Option<Barrier> {
++        (!dst.is_empty()).then(|| Barrier {
++            dst,
++            ..Self::after_completed()
++        })
++    }
++
++    /// The CPU reads and writes after the writes in `src` complete.
++    pub(super) fn to_host_from(src: Access) -> Option<Barrier> {
++        (!src.is_empty()).then_some(Barrier {
++            src,
++            dst: Access::new(
++                vk::PipelineStageFlags2::HOST,
++                vk::AccessFlags2::HOST_READ | vk::AccessFlags2::HOST_WRITE,
++            ),
++        })
++    }
++
+     /// The start of every batch with encoders on a driver whose submissions stall on semaphore
+     /// operations (`command_buffer/submit.rs`): what completed batches wrote is visible to every
+     /// later command. The tracker forgets a batch once it completed, so its writes are ordered by
+@@ -1164,6 +1183,10 @@ struct Part<K> {
+     /// allocates nothing of its own.
+     tracked: KeyMap<K, Few<Use<K>>>,
+     stages: vk::PipelineStageFlags2,
++    /// All accesses, including resources with disabled hazard tracking.
++    accesses: Access,
++    /// Writes into storage with a CPU consumer.
++    host_writes: Access,
+ }
+ 
+ impl<K> Part<K> {
+@@ -1171,6 +1194,8 @@ impl<K> Part<K> {
+         Part {
+             tracked: KeyMap::default(),
+             stages: vk::PipelineStageFlags2::NONE,
++            accesses: Access::NONE,
++            host_writes: Access::NONE,
+         }
+     }
+ }
+@@ -1242,6 +1267,9 @@ impl<K: Copy + Ord + Hash> EncoderUses<K> {
+         part.stages |= uses.iter().fold(stages, |all, used| {
+             all | used.read.stages | used.write.stages
+         });
++        for used in uses {
++            part.accesses = part.accesses.union(used.read).union(used.write);
++        }
+         if self.ordered {
+             admit(
+                 &mut self.inside,
+@@ -1277,6 +1305,12 @@ impl<K: Copy + Ord + Hash> EncoderUses<K> {
+         }
+     }
+ 
++    /// Add this command's writes into storage that has a CPU consumer to its current part.
++    pub(super) fn record_host_writes(&mut self, writes: Access) {
++        let part = self.current();
++        part.host_writes = part.host_writes.union(writes);
++    }
++
+     /// Whether a command the encoder recorded so far writes memory one of `uses` reads: an
+     /// overlapping range of a tracked resource. A command recorded before the encoder's earlier
+     /// commands run (a render encoder's index bounds pass, recorded before its pass) would read
+@@ -1428,6 +1462,8 @@ impl<K: Copy + Ord + Hash> EncoderUses<K> {
+                 Summary {
+                     uses,
+                     stages: part.stages,
++                    accesses: part.accesses,
++                    host_writes: part.host_writes,
+                     waits: Vec::new(),
+                     updates: Vec::new(),
+                 }
+@@ -1738,6 +1774,10 @@ pub(super) struct Summary<K> {
+     uses: Vec<Use<K>>,
+     /// Every stage the encoder's commands ran in.
+     stages: vk::PipelineStageFlags2,
++    /// Reads and writes of all resources, including untracked resources.
++    accesses: Access,
++    /// Writes to resources whose storage has a CPU consumer.
++    host_writes: Access,
+     /// The fences waited for before the encoder.
+     waits: Vec<FenceUse<K>>,
+     /// The fences updated after the encoder.
+@@ -1760,9 +1800,14 @@ impl<K: Copy + Ord> Summary<K> {
+     /// a batch's layout transitions of the caller's images, planned among its encoders.
+     pub(super) fn outside_encoders(mut uses: Vec<Use<K>>) -> Summary<K> {
+         uses.sort_by_key(|used| used.key);
++        let accesses = uses.iter().fold(Access::NONE, |all, used| {
++            all.union(used.read).union(used.write)
++        });
+         Summary {
+             uses,
+             stages: vk::PipelineStageFlags2::ALL_COMMANDS,
++            accesses,
++            host_writes: Access::NONE,
+             waits: Vec::new(),
+             updates: Vec::new(),
+         }
+@@ -1776,6 +1821,8 @@ impl<K: Copy + Ord> Summary<K> {
+         Summary {
+             uses: Vec::new(),
+             stages: vk::PipelineStageFlags2::ALL_COMMANDS,
++            accesses: Access::NONE,
++            host_writes: Access::NONE,
+             waits: waits.into_iter().map(every).collect(),
+             updates: updates.into_iter().map(every).collect(),
+         }
+@@ -1800,6 +1847,8 @@ impl<K: Copy + Ord> Summary<K> {
+     /// range into one of the same kind, which claims more and stays exact.
+     pub(super) fn join(&mut self, other: Summary<K>) {
+         self.stages |= other.stages;
++        self.accesses = self.accesses.union(other.accesses);
++        self.host_writes = self.host_writes.union(other.host_writes);
+         for used in other.uses {
+             if let Some(known) = self
+                 .uses
+@@ -1853,7 +1902,31 @@ impl<K: Copy + Ord + Hash> EncoderUses<K> {
+     }
+ }
+ 
++impl Summary<crate::resource::ResourceKey> {
++    /// Summarize image moves and copies recorded outside an encoder, including CPU visibility.
++    pub(super) fn outside_resource_uses(uses: Vec<Use<crate::resource::ResourceKey>>) -> Self {
++        let host_writes = uses
++            .iter()
++            .filter(|used| used.key.host_accessible())
++            .fold(Access::NONE, |all, used| all.union(used.write));
++        Self::outside_encoders(uses).with_host_writes(host_writes)
++    }
++}
++
+ impl<K> Summary<K> {
++    pub(super) fn accesses(&self) -> Access {
++        self.accesses
++    }
++
++    pub(super) fn host_writes(&self) -> Access {
++        self.host_writes
++    }
++
++    pub(super) fn with_host_writes(mut self, writes: Access) -> Self {
++        self.host_writes = self.host_writes.union(writes);
++        self
++    }
++
+     /// The tracked uses.
+     #[cfg(test)]
+     pub(super) fn uses(&self) -> &[Use<K>] {
+diff --git a/crates/metal2vulkan-runtime/src/work_counts.rs b/crates/metal2vulkan-runtime/src/work_counts.rs
+index 7283fc8c..a0cdfd89 100644
+--- a/crates/metal2vulkan-runtime/src/work_counts.rs
++++ b/crates/metal2vulkan-runtime/src/work_counts.rs
+@@ -35,6 +35,8 @@ pub(crate) enum Predicted {
+ /// A device's counters (`DeviceShared::counts`), each only ever added to.
+ #[derive(Default)]
+ pub(crate) struct Counters {
++    /// Resource declarations, barriers, fence operations and access masks, in bridge ABI order.
++    synchronization: [AtomicU64; 16],
+     /// Released objects and shadow keeps by kind (`churn_counts.rs`).
+     pub(crate) churn: super::churn_counts::ChurnCounters,
+     command_pools_made: AtomicU64,
+@@ -632,6 +634,51 @@ pub(crate) enum PoolCompiled {
+ }
+ 
+ impl Counters {
++    pub(crate) fn resources_declared(&self, count: usize) {
++        self.synchronization[0].fetch_add(count as u64, Ordering::Relaxed);
++    }
++
++    pub(crate) fn scope_barrier(&self) {
++        self.synchronization[1].fetch_add(1, Ordering::Relaxed);
++    }
++
++    pub(crate) fn resource_barrier(&self) {
++        self.synchronization[2].fetch_add(1, Ordering::Relaxed);
++    }
++
++    pub(crate) fn serial_barrier_elided(&self) {
++        self.synchronization[3].fetch_add(1, Ordering::Relaxed);
++    }
++
++    pub(crate) fn fence_updated(&self) {
++        self.synchronization[4].fetch_add(1, Ordering::Relaxed);
++    }
++
++    pub(crate) fn fence_waited(&self) {
++        self.synchronization[5].fetch_add(1, Ordering::Relaxed);
++    }
++
++    pub(crate) fn submission_accesses(
++        &self,
++        summaries: usize,
++        accesses: crate::tracker::Access,
++        host: crate::tracker::Access,
++    ) {
++        self.synchronization[6].fetch_add(summaries as u64, Ordering::Relaxed);
++        self.synchronization[7].fetch_add(u64::from(!accesses.is_empty()), Ordering::Relaxed);
++        self.synchronization[8].fetch_add(u64::from(!host.is_empty()), Ordering::Relaxed);
++        self.synchronization[9].fetch_add(u64::from(host.is_empty()), Ordering::Relaxed);
++        self.synchronization[12].fetch_or(accesses.stages.as_raw(), Ordering::Relaxed);
++        self.synchronization[13].fetch_or(host.stages.as_raw(), Ordering::Relaxed);
++        self.synchronization[14].fetch_or(accesses.access.as_raw(), Ordering::Relaxed);
++        self.synchronization[15].fetch_or(host.access.as_raw(), Ordering::Relaxed);
++    }
++
++    pub(crate) fn host_write_uses(&self, host: u64, private: u64) {
++        self.synchronization[10].fetch_add(host, Ordering::Relaxed);
++        self.synchronization[11].fetch_add(private, Ordering::Relaxed);
++    }
++
+     /// `count` commands of `kind` were recorded (`PoolCompiled`).
+     pub(crate) fn pool_compiled(&self, kind: PoolCompiled, count: u64) {
+         let counter = match kind {
+@@ -4879,6 +4926,17 @@ pub struct WorkCounts {
+ }
+ 
+ impl Device {
++    /// Resource declarations, scope/resource barriers, omitted serial barriers, fence updates
++    /// and waits, submitted summaries, access visibility, emitted/omitted CPU visibility,
++    /// CPU-consumed/private write uses, destination stages, CPU export stages, destination
++    /// accesses and CPU export accesses, in that order. Runtime extension without a Metal selector.
++    #[doc(hidden)]
++    pub fn synchronization_counts(&self) -> [u64; 16] {
++        std::array::from_fn(|index| {
++            self.shared().counts.synchronization[index].load(Ordering::Relaxed)
++        })
++    }
++
+     /// What its commit path did so far (`work_counts.rs`): counts the lanes hold to bounds. No
+     /// Metal counterpart; not part of the API.
+     #[doc(hidden)]

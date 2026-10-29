@@ -10,11 +10,14 @@
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurfaceRef.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #include <algorithm>
 #include <atomic>
 #include <mutex>
+#include <map>
 #include <pthread.h>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 #include <sys/mman.h>
@@ -131,6 +134,8 @@ static void waitForResource(id resource);
 @property(nonatomic) void *wrapped;
 @property(nonatomic,strong) id<MTLHeap> parentHeap;   // the heap that made the buffer, nil otherwise
 @property(nonatomic) NSUInteger heapOffset;
+// The runtime import retains this IOSurface object until its deallocator runs.
+@property(nonatomic) IOSurfaceRef importedSurface;
 @end
 @interface NBTexture : NBObject
 @property(nonatomic) NmbTexture *handle;
@@ -176,40 +181,128 @@ static void releaseSurface(void *context,void *,uint64_t) {gSurfaceImportsReleas
 - (IOSurfaceRef)iosurface {return nullptr;}   // a buffer is never the backing of a surface here (surfaces back textures)
 NB_RESOURCE_SPI
 @end
-// Reuse only an import still held by a texture/view or pending command. Weak
-// values never extend a GPU allocation's lifetime. The strong buffer snapshot
-// and its retained surface prevent object/address reuse during a hit. A new
-// mapping, allocation identity or size needs a separate import; ordinary
-// caller-owned no-copy buffers do not enter this cache.
+// IOSurface imports remain reusable while the surface has another local owner.
+// Completion, new imports and memory pressure release retained buffer objects.
+// The runtime owns their pinned pages until all GPU commands release them.
 static NSMapTable<NSValue *,NBBuffer *> *gSurfaceImports;
 static std::mutex gSurfaceImportLock;
+struct HeldImport {
+ NBBuffer *buffer;
+ IOSurfaceRef surface;
+};
+static auto &gHeldImports=*new std::map<std::tuple<uint64_t,uint64_t,uint64_t>,HeldImport>;
+static NSUInteger gSurfaceImportsPruned=64;
+static dispatch_source_t gImportPressureSource;
+
+static void pruneHeldImports(bool all,std::vector<NBBuffer *> &released) {
+ for(auto it=gHeldImports.begin();it!=gHeldImports.end();) {
+  if(all || CFGetRetainCount(it->second.surface)<=1) {
+   released.push_back(it->second.buffer);
+   it=gHeldImports.erase(it);
+  } else {
+   ++it;
+  }
+ }
+}
+
+static void trimHeldImports(bool all) {
+ std::vector<NBBuffer *> released;
+ {
+  std::lock_guard<std::mutex> lock(gSurfaceImportLock);
+  pruneHeldImports(all,released);
+ }
+
+ released.clear();
+}
+
+extern "C" void native_bridge_metal_trim_surface_imports(void) {
+ trimHeldImports(false);
+}
+
+static void watchImportPressure() {
+ static dispatch_once_t once;
+ dispatch_once(&once,^{
+  gImportPressureSource=dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE,0,
+   DISPATCH_MEMORYPRESSURE_WARN|DISPATCH_MEMORYPRESSURE_CRITICAL,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
+  if(!gImportPressureSource) {
+   return;
+  }
+
+  dispatch_source_set_event_handler(gImportPressureSource,^{
+   trimHeldImports(true);
+  });
+  dispatch_activate(gImportPressureSource);
+ });
+}
+
+static void holdImport(uint64_t identity,uint64_t address,uint64_t bytes,NBBuffer *buffer,std::vector<NBBuffer *> &released) {
+ pruneHeldImports(false,released);
+ gHeldImports[{identity,address,bytes}]={buffer,buffer.importedSurface};
+}
+
 static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
  struct Key {uint64_t identity,address,bytes;};
  const Key value={IOSurfaceGetID(surface),(uintptr_t)base,bytes};
  NSValue *key=value.identity?[NSValue valueWithBytes:&value objCType:@encode(Key)]:nil;
+ watchImportPressure();
+
+ // The snapshots are released after the lock, including on a cache hit.
+ std::vector<NBBuffer *> released;
  std::lock_guard<std::mutex> lock(gSurfaceImportLock);
  if(!gSurfaceImports)gSurfaceImports=[NSMapTable strongToWeakObjectsMapTable];
  NBBuffer *buffer=key?[gSurfaceImports objectForKey:key]:nil;
- if(buffer)return buffer;
+ if(buffer) {
+  holdImport(value.identity,value.address,value.bytes,buffer,released);
+
+  return buffer;
+ }
+
  // The surface keeps its CPU mapping (the imported pages) until the import is freed.
  NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface));
  if(!handle){CFRelease(surface);NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
  gSurfaceImportsMade++;buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;
+ buffer.importedSurface=surface;
  if(key) {
-  // Bound metadata without retaining old frames. Evicting an association is
-  // harmless: its owners still retain the actual import until their own end.
-  if(gSurfaceImports.count>=256) {
-   for(NSValue *old in gSurfaceImports.keyEnumerator.allObjects)
-    if(![gSurfaceImports objectForKey:old])[gSurfaceImports removeObjectForKey:old];
-   if(gSurfaceImports.count>=256)[gSurfaceImports removeObjectForKey:gSurfaceImports.keyEnumerator.nextObject];
+  if(gSurfaceImports.count>=gSurfaceImportsPruned) {
+   for(NSValue *old in gSurfaceImports.keyEnumerator.allObjects) {
+    if(![gSurfaceImports objectForKey:old]) {
+     [gSurfaceImports removeObjectForKey:old];
+    }
+   }
+
+   gSurfaceImportsPruned=MAX(gSurfaceImports.count*2,(NSUInteger)64);
   }
+
   [gSurfaceImports setObject:buffer forKey:key];
+  holdImport(value.identity,value.address,value.bytes,buffer,released);
  }
+
  return buffer;
 }
+
+static uint64_t textureRotation(id descriptor) {
+ SEL selector=sel_registerName("rotation");
+ if(![descriptor respondsToSelector:selector]) {
+  return 0;
+ }
+
+ return ((NSUInteger (*)(id,SEL))objc_msgSend)(descriptor,selector);
+}
+
+static bool textureFlag(id descriptor,const char *name) {
+ SEL selector=sel_registerName(name);
+
+ return [descriptor respondsToSelector:selector] && ((BOOL (*)(id,SEL))objc_msgSend)(descriptor,selector);
+}
+
 static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out) {
- if(!d)return false;
- *out={(uint64_t)d.textureType,(uint64_t)d.pixelFormat,d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions};
+ if(!d) {
+  return false;
+ }
+
+ *out={(uint64_t)d.textureType,(uint64_t)d.pixelFormat,d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,
+  (uint64_t)d.usage,(uint64_t)d.resourceOptions,textureRotation(d),textureFlag(d,"framebufferOnly"),textureFlag(d,"isDrawable")};
+
  return true;
 }
 @implementation NBTexture
@@ -226,7 +319,15 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
 - (MTLResourceOptions)resourceOptions {return (MTLResourceOptions)_descriptor.options;}
 - (MTLStorageMode)storageMode {return (MTLStorageMode)((_descriptor.options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);}
 - (MTLCPUCacheMode)cpuCacheMode {return (MTLCPUCacheMode)((_descriptor.options&MTLResourceCPUCacheModeMask)>>MTLResourceCPUCacheModeShift);}
-- (BOOL)isFramebufferOnly {return NO;}
+- (BOOL)isFramebufferOnly {
+ return _descriptor.framebuffer_only!=0;
+}
+- (NSUInteger)rotation {
+ return _descriptor.rotation;
+}
+- (BOOL)isDrawable {
+ return _descriptor.is_drawable!=0;
+}
 - (IOSurfaceRef)iosurface {return _surface;}
 - (NSUInteger)iosurfacePlane {return 0;}
 - (id<MTLBuffer>)buffer {return _surface?nil:(id<MTLBuffer>)_buffer;}
@@ -547,13 +648,25 @@ static void notified(void *context,uint64_t value) {
 @property(nonatomic) NmbEncoder *handle;
 @property(nonatomic,strong) NBCommandBuffer *commandBuffer;
 @end
+// Resource queries hold this mutex while a failed command buffer releases its runtime handle.
+static std::mutex gRuntimeHandleLock;
 static void waitForResource(id resource) {
  const uint64_t began=nowUs();
  NSArray *pending;@synchronized(gInFlight){pending=gInFlight.allObjects;}
  for(NBCommandBuffer *commandBuffer in pending) {
   int dependency=-1;
-  if([resource isKindOfClass:[NBBuffer class]])dependency=nmb_command_buffer_uses_buffer(commandBuffer.handle,[(NBBuffer *)resource handle]);
-  else if([resource isKindOfClass:[NBTexture class]])dependency=nmb_command_buffer_uses_texture(commandBuffer.handle,[(NBTexture *)resource handle]);
+  {
+   std::lock_guard<std::mutex> lock(gRuntimeHandleLock);
+   if(commandBuffer.handle) {
+    if([resource isKindOfClass:[NBBuffer class]]) {
+     dependency=nmb_command_buffer_uses_buffer(commandBuffer.handle,[(NBBuffer *)resource handle]);
+    } else if([resource isKindOfClass:[NBTexture class]]) {
+     dependency=nmb_command_buffer_uses_texture(commandBuffer.handle,[(NBTexture *)resource handle]);
+    }
+   } else {
+    dependency=0;
+   }
+  }
   gResourceChecks++;
   // An unknown result retains the old conservative wait. False means no matching storage
   // (or GPU work already completed), not a fabricated completion for a pending dependency.
@@ -907,6 +1020,17 @@ static void scheduled(void *context);
  if(self.failedLocally)return nbError(self.encodeFailure);
  if(self.status!=MTLCommandBufferStatusError)return nil;
  char text[512]={};nmb_command_buffer_error(_handle,text,sizeof text);
+ uint64_t code=nmb_command_buffer_metal_error_code(_handle);
+#if TARGET_OS_IPHONE
+ if(code==11) {
+  code=MTLCommandBufferErrorAccessRevoked;
+ }
+#endif
+ if(code) {
+  return [NSError errorWithDomain:MTLCommandBufferErrorDomain code:(NSInteger)code
+   userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithUTF8String:text]}];
+ }
+
  return nbError([NSString stringWithUTF8String:text]);
 }
 // Debug groups and cache hints name work for tools and the driver's caches; they change nothing the GPU computes here.
@@ -918,8 +1042,12 @@ static void scheduled(void *context);
 - (CFTimeInterval)kernelStartTime {return 0;}
 - (CFTimeInterval)kernelEndTime {return 0;}
 - (BOOL)commitAndWaitUntilSubmitted {[(id<MTLCommandBuffer>)self commit];[self waitUntilScheduled];return !self.failedLocally;}
-- (CFTimeInterval)GPUStartTime {return nmb_command_buffer_gpu_time(_handle,false);}
-- (CFTimeInterval)GPUEndTime {return nmb_command_buffer_gpu_time(_handle,true);}
+- (CFTimeInterval)GPUStartTime {
+ return self.failedLocally?0:nmb_command_buffer_gpu_time(_handle,false);
+}
+- (CFTimeInterval)GPUEndTime {
+ return self.failedLocally?0:nmb_command_buffer_gpu_time(_handle,true);
+}
 - (id)encoder:(NBEncoder *)encoder handle:(NmbEncoder *)handle what:(NSString *)what {
  if(self.committed){[self refuse:[what stringByAppendingString:@" after commit"]];return nil;}
  if(!handle){[self refuse:[NSString stringWithFormat:@"%@: %@",what,lastError()]];return nil;}
@@ -1037,6 +1165,15 @@ static void scheduled(void *context);
  // release point. A retained completed command must not pin every old frame.
  [_surfaces removeAllObjects];[_resourceOwners removeAllObjects];
  @synchronized(gInFlight){[gInFlight removeObject:self];}
+ trimHeldImports(false);
+
+ if(self.failedLocally) {
+  std::lock_guard<std::mutex> lock(gRuntimeHandleLock);
+  NmbCommandBuffer *handle=_handle;
+  _handle=nullptr;
+  nmb_command_buffer_release(handle);
+ }
+
  NSArray *completedHandlers;
  @synchronized(self){
   // A frontend refusal or a failed submission never scheduled. Unblock its waiter without inventing a scheduled event.
@@ -1430,6 +1567,25 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  NmbHeap *handle=nmb_heap_new(gDevice,d.type,d.size,(uint64_t)d.resourceOptions);
  if(!handle){NBLOG(@"native-metal: heap refused: %@",lastError());return nil;}
  NBHeap *heap=[NBHeap new];heap.handle=handle;heap.options=d.resourceOptions;heap.heapType=d.type;return (id<MTLHeap>)heap;
+}
+- (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor:(MTLTextureDescriptor *)descriptor {
+ NmbTextureDescriptor native;
+ uint64_t answer[2]={0,0};
+ if(textureDescriptor(descriptor,&native) && !nmb_device_heap_texture_size_and_align(gDevice,&native,answer)) {
+  NBLOG(@"native-metal: heap texture size fmt=%lu width=%lu height=%lu levels=%lu refused: %@",
+   (unsigned long)descriptor.pixelFormat,(unsigned long)descriptor.width,(unsigned long)descriptor.height,
+   (unsigned long)descriptor.mipmapLevelCount,lastError());
+ }
+
+ return (MTLSizeAndAlign){answer[0],answer[1]};
+}
+- (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
+ uint64_t answer[2]={0,0};
+ if(!nmb_device_heap_buffer_size_and_align(gDevice,length,(uint64_t)options,answer)) {
+  NBLOG(@"native-metal: heap buffer size refused: %@",lastError());
+ }
+
+ return (MTLSizeAndAlign){answer[0],answer[1]};
 }
 - (id)newResourceGroupFromResources:(const id __unsafe_unretained [])resources count:(NSUInteger)count {
  NBResourceGroup *group=[NBResourceGroup new];
@@ -1833,6 +1989,10 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  row("N no-copy %llu dealloc %llu/%llu surface %llu/%llu",(unsigned long long)gNoCopyAll.load(),(unsigned long long)gNoCopyReleased.load(),
   (unsigned long long)gNoCopyMade.load(),
   (unsigned long long)gSurfaceImportsReleased.load(),(unsigned long long)gSurfaceImportsMade.load());
+ uint64_t remaps[2]={};
+ if(nmb_no_copy_remaps(remaps)) {
+  row("N inspected ranges=%llu remapped=%llu",(unsigned long long)remaps[0],(unsigned long long)remaps[1]);
+ }
  // The runtime's VkPipeline makings (the creation log, METAL2VULKAN_LOG_PIPELINES; they happen at draws, not at the state's creation) and
  // its shader cache: where the driver's compile time goes.
  uint64_t work[10]={};
