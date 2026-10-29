@@ -1,3 +1,4 @@
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
 --- a/crates/metal2vulkan-runtime/src/lib.rs
 +++ b/crates/metal2vulkan-runtime/src/lib.rs
 @@ -113,6 +113,7 @@
@@ -8,6 +9,7 @@
  mod heap;
  mod heap_sets;
  mod host_aliases;
+diff --git a/crates/metal2vulkan-runtime/src/encoder.rs b/crates/metal2vulkan-runtime/src/encoder.rs
 --- a/crates/metal2vulkan-runtime/src/encoder.rs
 +++ b/crates/metal2vulkan-runtime/src/encoder.rs
 @@ -674,7 +674,30 @@
@@ -67,6 +69,7 @@
          let keyed = open
              .command_buffer
              .device()
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
 --- a/crates/metal2vulkan-runtime/src/render.rs
 +++ b/crates/metal2vulkan-runtime/src/render.rs
 @@ -2650,7 +2650,10 @@
@@ -188,6 +191,7 @@
          Recorded {
              states: recorded,
              writes_pushed,
+diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
 --- a/crates/metal2vulkan-runtime/src/device/mod.rs
 +++ b/crates/metal2vulkan-runtime/src/device/mod.rs
 @@ -455,6 +455,8 @@
@@ -216,6 +220,7 @@
              view_reinterpretation,
              generated_commands,
              host_image_copy,
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
 --- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
 +++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
 @@ -210,6 +210,8 @@
@@ -247,6 +252,7 @@
      }
  
      /// The state, locked.
+diff --git a/crates/metal2vulkan-runtime/src/render/pending.rs b/crates/metal2vulkan-runtime/src/render/pending.rs
 --- a/crates/metal2vulkan-runtime/src/render/pending.rs
 +++ b/crates/metal2vulkan-runtime/src/render/pending.rs
 @@ -67,6 +67,7 @@
@@ -265,6 +271,7 @@
                          command_buffer: cb,
                          layout: owned.layout,
                          shape: owned.shape,
+diff --git a/crates/metal2vulkan-runtime/src/render/inline_splits.rs b/crates/metal2vulkan-runtime/src/render/inline_splits.rs
 --- a/crates/metal2vulkan-runtime/src/render/inline_splits.rs
 +++ b/crates/metal2vulkan-runtime/src/render/inline_splits.rs
 @@ -613,6 +613,7 @@
@@ -275,6 +282,8 @@
                          command_buffer: held,
                          layout: owned.layout,
                          shape: owned.shape,
+diff --git a/crates/metal2vulkan-runtime/src/gpu_trace.rs b/crates/metal2vulkan-runtime/src/gpu_trace.rs
+new file mode 100644
 --- /dev/null
 +++ b/crates/metal2vulkan-runtime/src/gpu_trace.rs
 @@ -0,0 +1,242 @@
