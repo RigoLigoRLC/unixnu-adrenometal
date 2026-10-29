@@ -12,7 +12,15 @@ diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtim
 diff --git a/crates/metal2vulkan-runtime/src/encoder.rs b/crates/metal2vulkan-runtime/src/encoder.rs
 --- a/crates/metal2vulkan-runtime/src/encoder.rs
 +++ b/crates/metal2vulkan-runtime/src/encoder.rs
-@@ -674,7 +674,30 @@
+@@ -58,6 +58,7 @@
+ use super::sparse::encoder::SparseUpdate;
+ use super::texture::decoded_twin::TwinWrite;
+ use super::texture::kept_image::KeptLease;
++use super::texture::Texture;
+ use super::tracker::{Barrier, EncoderUses, Reach, Summary, Use, UseRange};
+ use super::unique_identifier::ScheduledWork;
+ use super::used_resources::EncoderKind;
+@@ -674,7 +675,30 @@
      pub(super) fn id(&self) -> u64 {
          self.id
      }
@@ -43,7 +51,7 @@ diff --git a/crates/metal2vulkan-runtime/src/encoder.rs b/crates/metal2vulkan-ru
      /// The command buffer the encoder records into.
      pub(super) fn command_buffer(&self) -> &CommandBuffer {
          &self.open.command_buffer
-@@ -2146,6 +2169,13 @@
+@@ -2146,6 +2170,13 @@
          }
          // Its last `VkCommandBuffer` stays recording, the command buffer's tail: its batch's end
          // may go into it (`CommandBufferShared::close_tail`).
@@ -57,7 +65,7 @@ diff --git a/crates/metal2vulkan-runtime/src/encoder.rs b/crates/metal2vulkan-ru
          let EncoderCore {
              mut open,
              raw,
-@@ -2168,6 +2198,11 @@
+@@ -2168,6 +2199,11 @@
              ..
          } = self;
          ended.push(raw);
@@ -435,7 +443,7 @@ new file mode 100644
 +                self.encoder,
 +                target.texture.object_id().get(),
 +                pair(target.extent[0].into(), target.extent[1].into()),
-+                target.texture.pixel_format().raw() | (load << 32) | (store << 40),
++                u64::from(target.texture.pixel_format().as_raw()) | (load << 32) | (store << 40),
 +            ],
 +        );
 +    }
@@ -457,7 +465,7 @@ new file mode 100644
 +                    self.encoder,
 +                    texture.object_id().get(),
 +                    pair(texture.width(), texture.height()),
-+                    pair(texture.pixel_format().raw(), texture.depth()),
++                    pair(u64::from(texture.pixel_format().as_raw()), texture.depth()),
 +                ],
 +                None => [self.encoder, 0, 0, 0],
 +            };
