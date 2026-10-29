@@ -14,6 +14,12 @@ heap sizing and command completion fixes from AdrenoMetal
 `547312cf58156f7abe5f83a3376a14f5cb157884`. The ordered runtime patch list is
 `bridge/patches/series`.
 
+The runtime sends Metal command buffer and encoder identities, render attachment
+actions, changed texture bindings and actual draw pipeline identities to Turnip's
+bounded GPU capture buffer. Deferred draws retain their Metal identities until
+their Vulkan commands are recorded. The driver owns capture control and export;
+the fixed metadata layout is documented in [bridge/TRACE_METADATA.md](bridge/TRACE_METADATA.md).
+
 The runtime keeps separate buffer and image memory pools for each Vulkan memory
 type. Pool growth is serialized independently of existing allocations and
 releases. An allocator that waited for growth searches the pool again before

@@ -1,0 +1,522 @@
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -113,6 +113,7 @@
+ mod gpu_execute;
+ mod gpu_pools;
+ mod gpu_time;
++mod gpu_trace;
+ mod heap;
+ mod heap_sets;
+ mod host_aliases;
+--- a/crates/metal2vulkan-runtime/src/encoder.rs
++++ b/crates/metal2vulkan-runtime/src/encoder.rs
+@@ -674,7 +674,30 @@
+     pub(super) fn id(&self) -> u64 {
+         self.id
+     }
++
++    /// The Metal objects that own commands recorded by this encoder.
++    pub(crate) fn trace_work(&self, pipeline: u64) -> crate::gpu_trace::Work {
++        let command_buffer = self.command_buffer();
+ 
++        crate::gpu_trace::Work {
++            trace: self.device().shared().trace,
++            command_buffer: command_buffer.trace_id(),
++            encoder: self.id,
++            queue: command_buffer.command_queue().id(),
++            pipeline,
++        }
++    }
++
++    /// The final Metal pass extent and attachment actions, associated by encoder ID.
++    pub(crate) fn trace_pass(&self, layout: &crate::render_pass::PassLayout) {
++        self.trace_work(0).pass(self.raw, layout);
++    }
++
++    /// The textures changed by one successful Metal binding operation.
++    pub(crate) fn trace_textures(&self, stage: u32, first: u32, textures: &[Option<&Texture>]) {
++        self.trace_work(0).textures(self.raw, stage, first, textures);
++    }
++
+     /// The command buffer the encoder records into.
+     pub(super) fn command_buffer(&self) -> &CommandBuffer {
+         &self.open.command_buffer
+@@ -2146,6 +2169,13 @@
+         }
+         // Its last `VkCommandBuffer` stays recording, the command buffer's tail: its batch's end
+         // may go into it (`CommandBufferShared::close_tail`).
++        let trace = self.trace_work(0);
++        let trace_kind = match kind {
++            EncoderKind::Render => 1,
++            EncoderKind::Compute => 2,
++            EncoderKind::Blit => 3,
++            _ => 4,
++        };
+         let EncoderCore {
+             mut open,
+             raw,
+@@ -2168,6 +2198,11 @@
+             ..
+         } = self;
+         ended.push(raw);
++        for &buffer in &ended {
++            trace.map(buffer, trace_kind);
++        }
++        trace.end(raw, trace_kind);
++
+         let keyed = open
+             .command_buffer
+             .device()
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -2650,7 +2650,10 @@
+             RenderCall::Texture(Table::Vertex, texture, index)
+         });
+         self.vertex
+-            .set_textures(&mut self.core, "set_vertex_texture", &[texture], index)
++            .set_textures(&mut self.core, "set_vertex_texture", &[texture], index)?;
++        self.core.trace_textures(1, index, &[texture]);
++
++        Ok(())
+     }
+ 
+     /// The lowering of [`RenderCommandEncoder::set_vertex_textures`].
+@@ -2661,7 +2664,10 @@
+     ) -> Result<(), Error> {
+         self.log(|log| RenderCall::Textures(Table::Vertex, log.texture_span(textures), first));
+         self.vertex
+-            .set_textures(&mut self.core, "set_vertex_textures", textures, first)
++            .set_textures(&mut self.core, "set_vertex_textures", textures, first)?;
++        self.core.trace_textures(1, first, textures);
++
++        Ok(())
+     }
+ 
+     /// The lowering of [`RenderCommandEncoder::set_vertex_sampler_state`].
+@@ -2768,7 +2774,10 @@
+             RenderCall::Texture(Table::Fragment, texture, index)
+         });
+         self.fragment
+-            .set_textures(&mut self.core, "set_fragment_texture", &[texture], index)
++            .set_textures(&mut self.core, "set_fragment_texture", &[texture], index)?;
++        self.core.trace_textures(2, index, &[texture]);
++
++        Ok(())
+     }
+ 
+     /// The lowering of [`RenderCommandEncoder::set_fragment_textures`].
+@@ -2779,7 +2788,10 @@
+     ) -> Result<(), Error> {
+         self.log(|log| RenderCall::Textures(Table::Fragment, log.texture_span(textures), first));
+         self.fragment
+-            .set_textures(&mut self.core, "set_fragment_textures", textures, first)
++            .set_textures(&mut self.core, "set_fragment_textures", textures, first)?;
++        self.core.trace_textures(2, first, textures);
++
++        Ok(())
+     }
+ 
+     /// The lowering of [`RenderCommandEncoder::set_fragment_sampler_state`].
+@@ -3902,6 +3914,7 @@
+     /// The lowering of [`RenderCommandEncoder::end_encoding`].
+     pub(crate) fn end_encoding(self: Box<Self>) -> Result<(), Error> {
+         self.core.device().shared().counts.render_encoder_ended();
++        self.core.trace_pass(&self.layout);
+         // And the pass's later color groups, where it draws in groups (`render/color_groups.rs`).
+         let (mut core, residency, log) = self.end_pass()?.with_later_groups()?;
+         // A notice of a kind the device refuses while lowering, announced by the end of an encoder
+@@ -3921,6 +3934,7 @@
+     /// (`render/replay.rs`), ended as [`end_encoding`](Self::end_encoding) ends one, into its
+     /// place: what it recorded, and what it made resident.
+     pub(super) fn finish_replay(self: Box<Self>) -> Result<(Replayed, Option<Residency>), Error> {
++        self.core.trace_pass(&self.layout);
+         let (core, residency, _) = self.end_pass()?.with_later_groups()?;
+         Ok((core.finish_replay()?, Some(residency)))
+     }
+@@ -9462,6 +9476,9 @@
+                             };
+                             let recording = Recording {
+                                 raw: device.shared().vk(),
++                                trace: self.core.trace_work(
++                                    self.pipeline.as_ref().map_or(0, RenderPipelineState::identifier_value),
++                                ),
+                                 command_buffer: self.current.draws,
+                                 layout: objects.layout(),
+                                 shape: objects.set_zero_shape(),
+@@ -10884,6 +10901,7 @@
+ /// Everything one draw records into the secondary command buffer.
+ struct Recording<'a> {
+     raw: &'a ash::Device,
++    trace: crate::gpu_trace::Work,
+     command_buffer: vk::CommandBuffer,
+     layout: vk::PipelineLayout,
+     /// The shape of the layout's set 0 and push-constant ranges
+@@ -10932,6 +10950,7 @@
+     /// The recording, owned, to record once its pipeline is made (`render/pending.rs`).
+     fn owned(&self) -> OwnedRecording {
+         OwnedRecording {
++            trace: self.trace,
+             layout: self.layout,
+             shape: self.shape,
+             sets: self.sets.to_vec(),
+@@ -10959,6 +10978,7 @@
+             into.clear();
+             into.extend_from_slice(from);
+         }
++        into.trace = self.trace;
+         into.layout = self.layout;
+         into.shape = self.shape;
+         refill(&mut into.sets, self.sets);
+@@ -11240,6 +11260,20 @@
+                 }
+             }
+         }
++        let issued = match self.draw {
++            metal2vulkan::vk::DrawCommand::DrawIndirect { .. }
++            | metal2vulkan::vk::DrawCommand::DrawIndexedIndirect { .. } => self.indirect.is_some(),
++            metal2vulkan::vk::DrawCommand::DrawMeshTasks { .. } => self.mesh.is_some(),
++            metal2vulkan::vk::DrawCommand::DrawMeshTasksIndirect { .. }
++            | metal2vulkan::vk::DrawCommand::DrawMeshTasksIndirectCount { .. } => {
++                self.mesh.is_some() && self.indirect.is_some()
++            }
++            _ => true,
++        };
++        if issued {
++            self.trace.draw(cb, self.pipeline, self.draw);
++        }
++
+         Recorded {
+             states: recorded,
+             writes_pushed,
+--- a/crates/metal2vulkan-runtime/src/device/mod.rs
++++ b/crates/metal2vulkan-runtime/src/device/mod.rs
+@@ -455,6 +455,8 @@
+     pub(super) residency: super::host_residency::Sweeper,
+     /// How its command buffers are timed on the GPU (`gpu_time.rs`).
+     pub(super) timing: Timing,
++    /// Metal workload metadata callbacks owned by the Vulkan driver's capture service.
++    pub(crate) trace: crate::gpu_trace::Trace,
+     /// Its Vulkan views may present an image in another component layout: it has no portability
+     /// subset, or the subset's `imageViewFormatReinterpretation` is enabled, by the runtime on a
+     /// device it made or, on an adopted one, by the consumer, who says so
+@@ -1717,6 +1719,8 @@
+                 recording.as_ref(),
+             )
+         };
++        // SAFETY: the loader word was restored above and the device is live.
++        let trace = unsafe { crate::gpu_trace::Trace::load(&instance.raw, raw.handle()) };
+         let shader_cache = match ShaderCache::start(
+             cache,
+             &physical_properties,
+@@ -1884,6 +1888,7 @@
+             #[cfg(unix)]
+             residency: Default::default(),
+             timing,
++            trace,
+             view_reinterpretation,
+             generated_commands,
+             host_image_copy,
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -210,6 +210,8 @@
+ }
+ 
+ pub(super) struct CommandBufferShared {
++    /// A process-wide identity retained through every batch and deferred recording.
++    trace_id: crate::resource::ObjectId,
+     device: Device,
+     queue: CommandQueue,
+     state: Mutex<State>,
+@@ -1780,6 +1782,7 @@
+     /// A new command buffer of `queue`, holding `slot` of it.
+     pub(super) fn new(queue: &CommandQueue, slot: Slot) -> CommandBuffer {
+         CommandBuffer(Arc::new(CommandBufferShared {
++            trace_id: crate::resource::ObjectId::new(),
+             device: queue.device().clone(),
+             queue: queue.clone(),
+             state: Mutex::new(State {
+@@ -1913,6 +1916,11 @@
+     /// `commandQueue`.
+     pub fn command_queue(&self) -> &CommandQueue {
+         &self.0.queue
++    }
++
++    /// The stable identity carried by GPU capture records for this command buffer.
++    pub(crate) fn trace_id(&self) -> u64 {
++        self.0.trace_id.get()
+     }
+ 
+     /// The state, locked.
+--- a/crates/metal2vulkan-runtime/src/render/pending.rs
++++ b/crates/metal2vulkan-runtime/src/render/pending.rs
+@@ -67,6 +67,7 @@
+ /// One recording of a draw, owned until its pipeline is made: [`Recording`]'s but for the
+ /// device, the command buffer and the pipeline.
+ pub(super) struct OwnedRecording {
++    pub(super) trace: crate::gpu_trace::Work,
+     pub(super) layout: vk::PipelineLayout,
+     pub(super) shape: u64,
+     pub(super) sets: Vec<vk::DescriptorSet>,
+@@ -215,6 +216,7 @@
+                 for owned in &self.recordings {
+                     recorded += Recording {
+                         raw,
++                        trace: owned.trace,
+                         command_buffer: cb,
+                         layout: owned.layout,
+                         shape: owned.shape,
+--- a/crates/metal2vulkan-runtime/src/render/inline_splits.rs
++++ b/crates/metal2vulkan-runtime/src/render/inline_splits.rs
+@@ -613,6 +613,7 @@
+                     };
+                     recorded += Recording {
+                         raw,
++                        trace: owned.trace,
+                         command_buffer: held,
+                         layout: owned.layout,
+                         shape: owned.shape,
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/gpu_trace.rs
+@@ -0,0 +1,242 @@
++//! Metal workload metadata sent to the driver's bounded GPU capture buffer.
++//! The driver owns capture control, timestamps, submission links and transport.
++
++use crate::render_pass::{PassLayout, Target};
++use crate::texture::Texture;
++use ash::vk;
++use ash::vk::Handle;
++
++type Enabled = unsafe extern "system" fn(vk::Device) -> vk::Bool32;
++type Record = unsafe extern "system" fn(vk::Device, vk::CommandBuffer, u32, u32, *const u64, u32);
++
++/// Trace holds the optional driver's metadata callbacks for one Vulkan device.
++/// Calls copy at most four words into the driver's bounded buffer while capture
++/// is enabled. The driver owns timestamping, capture capacity and transport.
++#[derive(Clone, Copy)]
++pub(crate) struct Trace {
++    device: vk::Device,
++    enabled: Option<Enabled>,
++    record: Option<Record>,
++}
++
++impl Trace {
++    /// The callbacks returned by the live device's loader, when present.
++    pub(crate) unsafe fn load(instance: &ash::Instance, device: vk::Device) -> Self {
++        // SAFETY: these private entry points have the signatures declared above.
++        let (enabled, record) = unsafe {
++            (
++                instance.get_device_proc_addr(device, c"vkNativeAdrenoTraceEnabled".as_ptr()),
++                instance.get_device_proc_addr(device, c"vkNativeAdrenoTraceMetal".as_ptr()),
++            )
++        };
++
++        Self {
++            device,
++            // SAFETY: the driver exports the exact signatures declared above.
++            enabled: enabled.map(|function| unsafe { std::mem::transmute(function) }),
++            record: record.map(|function| unsafe { std::mem::transmute(function) }),
++        }
++    }
++
++    pub(crate) fn enabled(self) -> bool {
++        match (self.enabled, self.record) {
++            // SAFETY: the device owns these callbacks throughout each recording.
++            (Some(enabled), Some(_)) => unsafe { enabled(self.device) != 0 },
++            _ => false,
++        }
++    }
++
++    fn emit(self, raw: vk::CommandBuffer, point: u32, flags: u32, words: [u64; 4]) {
++        if !self.enabled() {
++            return;
++        }
++
++        if let Some(record) = self.record {
++            // SAFETY: the driver copies the words before returning. A null
++            // command buffer denotes metadata associated by the encoder ID.
++            unsafe { record(self.device, raw, point, flags, words.as_ptr(), 4) };
++        }
++    }
++}
++
++/// Work names a Metal command buffer, encoder and pipeline while Vulkan commands
++/// are recorded. Deferred draws retain these numbers with their recording data.
++#[derive(Clone, Copy)]
++pub(crate) struct Work {
++    pub(crate) trace: Trace,
++    pub(crate) command_buffer: u64,
++    pub(crate) encoder: u64,
++    pub(crate) queue: u64,
++    pub(crate) pipeline: u64,
++}
++
++impl Work {
++    pub(crate) fn map(self, raw: vk::CommandBuffer, kind: u64) {
++        self.trace.emit(
++            raw,
++            1,
++            0,
++            [self.command_buffer, self.encoder, self.queue, kind],
++        );
++    }
++
++    pub(crate) fn end(self, raw: vk::CommandBuffer, kind: u64) {
++        self.trace.emit(
++            raw,
++            7,
++            0,
++            [self.command_buffer, self.encoder, kind, 0],
++        );
++    }
++
++    pub(crate) fn pass(self, raw: vk::CommandBuffer, layout: &PassLayout) {
++        if !self.trace.enabled() {
++            return;
++        }
++
++        self.trace.emit(
++            raw,
++            2,
++            0,
++            [
++                self.encoder,
++                pair(layout.extent[0].into(), layout.extent[1].into()),
++                pair(layout.layers.into(), layout.samples.into()),
++                layout.colors.iter().flatten().count() as u64
++                    + u64::from(layout.depth_stencil.is_some()),
++            ],
++        );
++
++        for (index, color) in layout.colors.iter().enumerate() {
++            if let Some(color) = color {
++                self.attachment(
++                    raw,
++                    index as u32,
++                    &color.target,
++                    color.load.raw(),
++                    color.store.raw(),
++                );
++            }
++        }
++
++        if let Some(target) = &layout.depth_stencil {
++            if let Some(depth) = &target.depth {
++                self.attachment(raw, 0x100, &target.target, depth.load.raw(), depth.store.raw());
++            }
++
++            if let Some(stencil) = &target.stencil {
++                self.attachment(raw, 0x200, &target.target, stencil.load.raw(), stencil.store.raw());
++            }
++        }
++    }
++
++    fn attachment(
++        self,
++        raw: vk::CommandBuffer,
++        slot: u32,
++        target: &Target,
++        load: u64,
++        store: u64,
++    ) {
++        self.trace.emit(
++            raw,
++            3,
++            slot,
++            [
++                self.encoder,
++                target.texture.object_id().get(),
++                pair(target.extent[0].into(), target.extent[1].into()),
++                target.texture.pixel_format().raw() | (load << 32) | (store << 40),
++            ],
++        );
++    }
++
++    pub(crate) fn textures(
++        self,
++        raw: vk::CommandBuffer,
++        stage: u32,
++        first: u32,
++        textures: &[Option<&Texture>],
++    ) {
++        if !self.trace.enabled() {
++            return;
++        }
++
++        for (index, texture) in (first..).zip(textures) {
++            let words = match texture {
++                Some(texture) => [
++                    self.encoder,
++                    texture.object_id().get(),
++                    pair(texture.width(), texture.height()),
++                    pair(texture.pixel_format().raw(), texture.depth()),
++                ],
++                None => [self.encoder, 0, 0, 0],
++            };
++            self.trace.emit(raw, 4, stage | (index << 8), words);
++        }
++    }
++
++    pub(crate) fn draw(
++        self,
++        raw: vk::CommandBuffer,
++        pipeline: vk::Pipeline,
++        draw: metal2vulkan::vk::DrawCommand,
++    ) {
++        if !self.trace.enabled() {
++            return;
++        }
++
++        use metal2vulkan::vk::DrawCommand;
++        let (kind, count, instances) = match draw {
++            DrawCommand::Draw {
++                vertex_count,
++                instance_count,
++                ..
++            } => (1, vertex_count.into(), instance_count.into()),
++            DrawCommand::DrawIndexed {
++                index_count,
++                instance_count,
++                ..
++            } => (2, index_count.into(), instance_count.into()),
++            DrawCommand::DrawIndirect { draw_count, .. } => {
++                (3, draw_count.into(), 0)
++            }
++            DrawCommand::DrawIndexedIndirect { draw_count, .. } => {
++                (4, draw_count.into(), 0)
++            }
++            DrawCommand::DrawMeshTasks {
++                group_count_x,
++                group_count_y,
++                group_count_z,
++            } => (
++                5,
++                pair(group_count_x.into(), group_count_y.into()),
++                group_count_z.into(),
++            ),
++            DrawCommand::DrawMeshTasksIndirect { draw_count, .. } => {
++                (6, draw_count.into(), 0)
++            }
++            DrawCommand::DrawMeshTasksIndirectCount { max_draw_count, .. } => {
++                (7, max_draw_count.into(), 0)
++            }
++        };
++
++        self.map(raw, 1);
++        self.trace.emit(
++            raw,
++            5,
++            kind,
++            [self.encoder, self.pipeline, pipeline.as_raw(), kind.into()],
++        );
++        self.trace.emit(
++            raw,
++            6,
++            kind,
++            [self.encoder, self.pipeline, count, instances],
++        );
++    }
++}
++
++fn pair(low: u64, high: u64) -> u64 {
++    (low & u32::MAX as u64) | ((high & u32::MAX as u64) << 32)
++}

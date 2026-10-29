@@ -21,3 +21,4 @@
 0021-coordinate-coherent-memory-pool-growth.patch
 0022-bound-idle-command-pools-on-ios.patch
 0023-preserve-metal-stages-and-host-visibility.patch
+0024-gpu-capture-metal-workload-metadata.patch
