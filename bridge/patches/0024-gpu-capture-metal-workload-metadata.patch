@@ -614,3 +614,14 @@ new file mode 100644
 +fn pair(low: u64, high: u64) -> u64 {
 +    (low & u32::MAX as u64) | ((high & u32::MAX as u64) << 32)
 +}
+diff --git a/crates/metal2vulkan-runtime/src/render/executions.rs b/crates/metal2vulkan-runtime/src/render/executions.rs
+--- a/crates/metal2vulkan-runtime/src/render/executions.rs
++++ b/crates/metal2vulkan-runtime/src/render/executions.rs
+@@ -2315,6 +2315,7 @@
+         let mut shadows = InstanceShadows::default();
+         shadows.add(&self.shadows, &[]);
+         RenderLowering {
+             core,
++            traced_pass_generation: 0,
+             earlier: Vec::new(),
+             current: Instance {
