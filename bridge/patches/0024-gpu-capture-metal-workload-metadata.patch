@@ -20,15 +20,16 @@ diff --git a/crates/metal2vulkan-runtime/src/encoder.rs b/crates/metal2vulkan-ru
  use super::tracker::{Barrier, EncoderUses, Reach, Summary, Use, UseRange};
  use super::unique_identifier::ScheduledWork;
  use super::used_resources::EncoderKind;
-@@ -674,7 +675,30 @@
+@@ -673,6 +674,29 @@
+     /// retained into it holds until it changes (`ArgumentTable::retain`).
      pub(super) fn id(&self) -> u64 {
          self.id
-     }
++    }
 +
 +    /// The Metal objects that own commands recorded by this encoder.
 +    pub(crate) fn trace_work(&self, pipeline: u64) -> crate::gpu_trace::Work {
 +        let command_buffer = self.command_buffer();
- 
++
 +        crate::gpu_trace::Work {
 +            trace: self.device().shared().trace,
 +            command_buffer: command_buffer.trace_id(),
@@ -39,18 +40,16 @@ diff --git a/crates/metal2vulkan-runtime/src/encoder.rs b/crates/metal2vulkan-ru
 +    }
 +
 +    /// The final Metal pass extent and attachment actions, associated by encoder ID.
-+    pub(crate) fn trace_pass(&self, layout: &crate::render_pass::PassLayout) {
-+        self.trace_work(0).pass(self.raw, layout);
++    pub(crate) fn trace_pass(&self, layout: &crate::render_pass::PassLayout, final_actions: bool) {
++        self.trace_work(0).pass(self.raw, layout, final_actions);
 +    }
 +
 +    /// The textures changed by one successful Metal binding operation.
 +    pub(crate) fn trace_textures(&self, stage: u32, first: u32, textures: &[Option<&Texture>]) {
 +        self.trace_work(0).textures(self.raw, stage, first, textures);
-+    }
-+
+     }
+ 
      /// The command buffer the encoder records into.
-     pub(super) fn command_buffer(&self) -> &CommandBuffer {
-         &self.open.command_buffer
 @@ -2146,6 +2170,13 @@
          }
          // Its last `VkCommandBuffer` stays recording, the command buffer's tail: its batch's end
@@ -80,7 +79,24 @@ diff --git a/crates/metal2vulkan-runtime/src/encoder.rs b/crates/metal2vulkan-ru
 diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
 --- a/crates/metal2vulkan-runtime/src/render.rs
 +++ b/crates/metal2vulkan-runtime/src/render.rs
-@@ -2650,7 +2650,10 @@
+@@ -1342,6 +1342,8 @@
+ /// calls runs on.
+ pub(crate) struct RenderLowering {
+     core: EncoderCore,
++    /// The capture generation that already received this encoder's initial pass description.
++    traced_pass_generation: u32,
+     /// The pass's instances before the current one, which the draws record into.
+     earlier: Vec<Instance>,
+     current: Instance,
+@@ -1944,6 +1946,7 @@
+         let bind_memo = core.device().shared().bind_memos.take();
+         Box::new(RenderLowering {
+             core,
++            traced_pass_generation: 0,
+             earlier: Vec::new(),
+             current: Instance {
+                 draws,
+@@ -2650,7 +2653,10 @@
              RenderCall::Texture(Table::Vertex, texture, index)
          });
          self.vertex
@@ -92,7 +108,7 @@ diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-run
      }
  
      /// The lowering of [`RenderCommandEncoder::set_vertex_textures`].
-@@ -2661,7 +2664,10 @@
+@@ -2661,7 +2667,10 @@
      ) -> Result<(), Error> {
          self.log(|log| RenderCall::Textures(Table::Vertex, log.texture_span(textures), first));
          self.vertex
@@ -104,7 +120,7 @@ diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-run
      }
  
      /// The lowering of [`RenderCommandEncoder::set_vertex_sampler_state`].
-@@ -2768,7 +2774,10 @@
+@@ -2768,7 +2777,10 @@
              RenderCall::Texture(Table::Fragment, texture, index)
          });
          self.fragment
@@ -116,7 +132,7 @@ diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-run
      }
  
      /// The lowering of [`RenderCommandEncoder::set_fragment_textures`].
-@@ -2779,7 +2788,10 @@
+@@ -2779,7 +2791,10 @@
      ) -> Result<(), Error> {
          self.log(|log| RenderCall::Textures(Table::Fragment, log.texture_span(textures), first));
          self.fragment
@@ -128,23 +144,36 @@ diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-run
      }
  
      /// The lowering of [`RenderCommandEncoder::set_fragment_sampler_state`].
-@@ -3902,6 +3914,7 @@
+@@ -3902,6 +3917,7 @@
      /// The lowering of [`RenderCommandEncoder::end_encoding`].
      pub(crate) fn end_encoding(self: Box<Self>) -> Result<(), Error> {
          self.core.device().shared().counts.render_encoder_ended();
-+        self.core.trace_pass(&self.layout);
++        self.core.trace_pass(&self.layout, true);
          // And the pass's later color groups, where it draws in groups (`render/color_groups.rs`).
          let (mut core, residency, log) = self.end_pass()?.with_later_groups()?;
          // A notice of a kind the device refuses while lowering, announced by the end of an encoder
-@@ -3921,6 +3934,7 @@
+@@ -3921,6 +3937,7 @@
      /// (`render/replay.rs`), ended as [`end_encoding`](Self::end_encoding) ends one, into its
      /// place: what it recorded, and what it made resident.
      pub(super) fn finish_replay(self: Box<Self>) -> Result<(Replayed, Option<Residency>), Error> {
-+        self.core.trace_pass(&self.layout);
++        self.core.trace_pass(&self.layout, true);
          let (core, residency, _) = self.end_pass()?.with_later_groups()?;
          Ok((core.finish_replay()?, Some(residency)))
      }
-@@ -9462,6 +9476,9 @@
+@@ -7186,6 +7203,12 @@
+         buffers: DrawBuffers<'_>,
+         empty: bool,
+     ) -> Result<(), Error> {
++        let generation = self.core.device().shared().trace.generation();
++        if generation != 0 && self.traced_pass_generation != generation {
++            self.core.trace_pass(&self.layout, false);
++            self.traced_pass_generation = generation;
++        }
++
+         let Some(pipeline) = drawn_by(call, self.pipeline.as_ref(), assembly, empty)? else {
+             return Ok(());
+         };
+@@ -9462,6 +9485,9 @@
                              };
                              let recording = Recording {
                                  raw: device.shared().vk(),
@@ -154,7 +183,7 @@ diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-run
                                  command_buffer: self.current.draws,
                                  layout: objects.layout(),
                                  shape: objects.set_zero_shape(),
-@@ -10884,6 +10901,7 @@
+@@ -10884,6 +10910,7 @@
  /// Everything one draw records into the secondary command buffer.
  struct Recording<'a> {
      raw: &'a ash::Device,
@@ -162,7 +191,7 @@ diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-run
      command_buffer: vk::CommandBuffer,
      layout: vk::PipelineLayout,
      /// The shape of the layout's set 0 and push-constant ranges
-@@ -10932,6 +10950,7 @@
+@@ -10932,6 +10959,7 @@
      /// The recording, owned, to record once its pipeline is made (`render/pending.rs`).
      fn owned(&self) -> OwnedRecording {
          OwnedRecording {
@@ -170,7 +199,7 @@ diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-run
              layout: self.layout,
              shape: self.shape,
              sets: self.sets.to_vec(),
-@@ -10959,6 +10978,7 @@
+@@ -10959,6 +10987,7 @@
              into.clear();
              into.extend_from_slice(from);
          }
@@ -178,7 +207,7 @@ diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-run
          into.layout = self.layout;
          into.shape = self.shape;
          refill(&mut into.sets, self.sets);
-@@ -11240,6 +11260,20 @@
+@@ -11240,6 +11269,20 @@
                  }
              }
          }
@@ -193,7 +222,7 @@ diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-run
 +            _ => true,
 +        };
 +        if issued {
-+            self.trace.draw(cb, self.pipeline, self.draw);
++            self.trace.draw(cb, self.pipeline, self.draw, &mut bound.metadata);
 +        }
 +
          Recorded {
@@ -290,11 +319,23 @@ diff --git a/crates/metal2vulkan-runtime/src/render/inline_splits.rs b/crates/me
                          command_buffer: held,
                          layout: owned.layout,
                          shape: owned.shape,
+diff --git a/crates/metal2vulkan-runtime/src/render/bound.rs b/crates/metal2vulkan-runtime/src/render/bound.rs
+--- a/crates/metal2vulkan-runtime/src/render/bound.rs
++++ b/crates/metal2vulkan-runtime/src/render/bound.rs
+@@ -119,6 +119,8 @@
+ /// docs).
+ #[derive(Default)]
+ pub(super) struct Bound {
++    /// Metal identities emitted for this command buffer in the current GPU capture.
++    pub(super) metadata: crate::gpu_trace::RecordedMetadata,
+     /// The command buffer: null before its first draw.
+     command_buffer: vk::CommandBuffer,
+     /// The bound pipeline: null before the first.
 diff --git a/crates/metal2vulkan-runtime/src/gpu_trace.rs b/crates/metal2vulkan-runtime/src/gpu_trace.rs
 new file mode 100644
 --- /dev/null
 +++ b/crates/metal2vulkan-runtime/src/gpu_trace.rs
-@@ -0,0 +1,242 @@
+@@ -0,0 +1,278 @@
 +//! Metal workload metadata sent to the driver's bounded GPU capture buffer.
 +//! The driver owns capture control, timestamps, submission links and transport.
 +
@@ -335,12 +376,17 @@ new file mode 100644
 +        }
 +    }
 +
-+    pub(crate) fn enabled(self) -> bool {
++    /// The active capture generation, or zero while metadata admission is closed.
++    pub(crate) fn generation(self) -> u32 {
 +        match (self.enabled, self.record) {
 +            // SAFETY: the device owns these callbacks throughout each recording.
-+            (Some(enabled), Some(_)) => unsafe { enabled(self.device) != 0 },
-+            _ => false,
++            (Some(enabled), Some(_)) => unsafe { enabled(self.device) },
++            _ => 0,
 +        }
++    }
++
++    pub(crate) fn enabled(self) -> bool {
++        self.generation() != 0
 +    }
 +
 +    fn emit(self, raw: vk::CommandBuffer, point: u32, flags: u32, words: [u64; 4]) {
@@ -367,6 +413,17 @@ new file mode 100644
 +    pub(crate) pipeline: u64,
 +}
 +
++/// RecordedMetadata contains the Metal identities already emitted for one Vulkan
++/// command buffer during a capture. Bound resets it when its command buffer changes.
++#[derive(Default)]
++pub(crate) struct RecordedMetadata {
++    generation: u32,
++    command_buffer: u64,
++    encoder: u64,
++    pipeline: u64,
++    vulkan_pipeline: vk::Pipeline,
++}
++
 +impl Work {
 +    pub(crate) fn map(self, raw: vk::CommandBuffer, kind: u64) {
 +        self.trace.emit(
@@ -386,7 +443,7 @@ new file mode 100644
 +        );
 +    }
 +
-+    pub(crate) fn pass(self, raw: vk::CommandBuffer, layout: &PassLayout) {
++    pub(crate) fn pass(self, raw: vk::CommandBuffer, layout: &PassLayout, final_actions: bool) {
 +        if !self.trace.enabled() {
 +            return;
 +        }
@@ -394,7 +451,7 @@ new file mode 100644
 +        self.trace.emit(
 +            raw,
 +            2,
-+            0,
++            u32::from(final_actions),
 +            [
 +                self.encoder,
 +                pair(layout.extent[0].into(), layout.extent[1].into()),
@@ -404,11 +461,12 @@ new file mode 100644
 +            ],
 +        );
 +
++        let attachment_flags = u32::from(final_actions) << 15;
 +        for (index, color) in layout.colors.iter().enumerate() {
 +            if let Some(color) = color {
 +                self.attachment(
 +                    raw,
-+                    index as u32,
++                    attachment_flags | index as u32,
 +                    &color.target,
 +                    color.load.raw(),
 +                    color.store.raw(),
@@ -418,11 +476,11 @@ new file mode 100644
 +
 +        if let Some(target) = &layout.depth_stencil {
 +            if let Some(depth) = &target.depth {
-+                self.attachment(raw, 0x100, &target.target, depth.load.raw(), depth.store.raw());
++                self.attachment(raw, attachment_flags | 0x100, &target.target, depth.load.raw(), depth.store.raw());
 +            }
 +
 +            if let Some(stencil) = &target.stencil {
-+                self.attachment(raw, 0x200, &target.target, stencil.load.raw(), stencil.store.raw());
++                self.attachment(raw, attachment_flags | 0x200, &target.target, stencil.load.raw(), stencil.store.raw());
 +            }
 +        }
 +    }
@@ -478,8 +536,10 @@ new file mode 100644
 +        raw: vk::CommandBuffer,
 +        pipeline: vk::Pipeline,
 +        draw: metal2vulkan::vk::DrawCommand,
++        recorded: &mut RecordedMetadata,
 +    ) {
-+        if !self.trace.enabled() {
++        let generation = self.trace.generation();
++        if generation == 0 {
 +            return;
 +        }
 +
@@ -518,13 +578,30 @@ new file mode 100644
 +            }
 +        };
 +
-+        self.map(raw, 1);
-+        self.trace.emit(
-+            raw,
-+            5,
-+            kind,
-+            [self.encoder, self.pipeline, pipeline.as_raw(), kind.into()],
-+        );
++        if recorded.generation != generation
++            || recorded.command_buffer != self.command_buffer
++            || recorded.encoder != self.encoder
++        {
++            self.map(raw, 1);
++            *recorded = RecordedMetadata {
++                generation,
++                command_buffer: self.command_buffer,
++                encoder: self.encoder,
++                ..RecordedMetadata::default()
++            };
++        }
++
++        if recorded.pipeline != self.pipeline || recorded.vulkan_pipeline != pipeline {
++            self.trace.emit(
++                raw,
++                5,
++                kind,
++                [self.encoder, self.pipeline, pipeline.as_raw(), kind.into()],
++            );
++            recorded.pipeline = self.pipeline;
++            recorded.vulkan_pipeline = pipeline;
++        }
++
 +        self.trace.emit(
 +            raw,
 +            6,
