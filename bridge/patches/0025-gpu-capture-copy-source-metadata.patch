@@ -1,0 +1,522 @@
+diff --git a/crates/metal2vulkan-runtime/src/buffer_texture.rs b/crates/metal2vulkan-runtime/src/buffer_texture.rs
+index 1499665..ae0af25 100644
+--- a/crates/metal2vulkan-runtime/src/buffer_texture.rs
++++ b/crates/metal2vulkan-runtime/src/buffer_texture.rs
+@@ -1115,6 +1115,7 @@ impl Texels {
+         )?);
+         let (bytes, tracked) = self.buffer.tracked(layout.offset..layout.end());
+         Ok(ShadowCopies {
++            trace: crate::gpu_trace::ShadowMetadata::default(),
+             source: ShadowSource::Bytes {
+                 buffer: ShadowBuffer::of(&self.buffer, buffer),
+                 key: bytes.key,
+@@ -1293,6 +1294,7 @@ impl Texels {
+         let (bytes, tracked) = texels.buffer.tracked(layout.offset..layout.end());
+         let shadow_range = UseRange::Bytes(0..staging.into.size);
+         let copies = ShadowCopies {
++            trace: crate::gpu_trace::ShadowMetadata::default(),
+             source: ShadowSource::Bytes {
+                 buffer: ShadowBuffer::of(&texels.buffer, raw),
+                 key: bytes.key,
+@@ -1411,6 +1413,7 @@ impl Texels {
+         let one_region = regions.len() == 1 && slices == 1 && staging.is_none();
+         let (bytes, tracked) = self.buffer.tracked(layout.offset..layout.end());
+         Ok(ShadowCopies {
++            trace: crate::gpu_trace::ShadowMetadata::default(),
+             source: ShadowSource::Bytes {
+                 buffer: ShadowBuffer::of(&self.buffer, buffer),
+                 key: bytes.key,
+diff --git a/crates/metal2vulkan-runtime/src/device/functions.rs b/crates/metal2vulkan-runtime/src/device/functions.rs
+index 3008d66..e1ca8c7 100644
+--- a/crates/metal2vulkan-runtime/src/device/functions.rs
++++ b/crates/metal2vulkan-runtime/src/device/functions.rs
+@@ -82,6 +82,7 @@ pub(crate) struct Vk {
+     push_descriptor: Option<vk::PFN_vkCmdPushDescriptorSetKHR>,
+     object_name: Option<vk::PFN_vkSetDebugUtilsObjectNameEXT>,
+     copies: Arc<CopySites>,
++    trace: Option<crate::gpu_trace::Trace>,
+ }
+ 
+ impl Vk {
+@@ -102,9 +103,19 @@ impl Vk {
+             push_descriptor,
+             object_name,
+             copies,
++            trace: None,
+         }
+     }
+ 
++    fn with_trace(mut self, trace: crate::gpu_trace::Trace) -> Self {
++        self.trace = Some(trace);
++        self
++    }
++
++    pub(crate) fn copy_trace(&self) -> Option<crate::gpu_trace::Trace> {
++        self.trace
++    }
++
+     /// The reads a global memory barrier's destination names.
+     pub(crate) fn reads(&self) -> MemoryReads {
+         self.reads
+@@ -194,6 +205,9 @@ impl Vk {
+         regions: &[vk::BufferImageCopy],
+     ) {
+         (self.copies).count("vkCmdCopyBufferToImage", Location::caller(), regions.len());
++        if let Some(trace) = self.trace {
++            trace.copy_buffer_to_image(command_buffer, src, dst, regions, Location::caller());
++        }
+         // SAFETY: the caller's contract.
+         unsafe {
+             (self.device).cmd_copy_buffer_to_image(command_buffer, src, dst, layout, regions);
+@@ -284,6 +298,8 @@ impl Functions {
+         recording: Option<&Slot>,
+     ) -> Functions {
+         let handle = all.handle();
++        // SAFETY: the caller supplies this live device and its instance loader.
++        let trace = unsafe { crate::gpu_trace::Trace::load(instance, handle) };
+         let get = instance.fp_v1_0().get_device_proc_addr;
+         // SAFETY: the caller's contract; a missing function is null, as ash loads it.
+         let address = |name: &CStr| unsafe {
+@@ -327,8 +343,8 @@ impl Functions {
+                 push_descriptor,
+                 object_name,
+                 Arc::clone(&copies),
+-            ),
+-            sectioned: Vk::new(sectioned, reads, push_descriptor, object_name, copies),
++            ).with_trace(trace),
++            sectioned: Vk::new(sectioned, reads, push_descriptor, object_name, copies).with_trace(trace),
+             entry_points,
+         }
+     }
+diff --git a/crates/metal2vulkan-runtime/src/gpu_trace.rs b/crates/metal2vulkan-runtime/src/gpu_trace.rs
+index 7474a2c..5b6fc01 100644
+--- a/crates/metal2vulkan-runtime/src/gpu_trace.rs
++++ b/crates/metal2vulkan-runtime/src/gpu_trace.rs
+@@ -5,10 +5,159 @@ use crate::render_pass::{PassLayout, Target};
+ use crate::texture::Texture;
+ use ash::vk;
+ use ash::vk::Handle;
++use std::cell::Cell;
++use std::panic::Location;
++use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
++use std::sync::OnceLock;
+ 
+ type Enabled = unsafe extern "system" fn(vk::Device) -> vk::Bool32;
+ type Record = unsafe extern "system" fn(vk::Device, vk::CommandBuffer, u32, u32, *const u64, u32);
+ 
++static COPY_ID: AtomicU64 = AtomicU64::new(1);
++const COPY_REGIONS: usize = 32;
++
++#[derive(Clone, Copy, Default)]
++struct CopyContext {
++    cause: u32,
++    texel_bytes: u64,
++    image: vk::Image,
++    shadow: bool,
++}
++
++thread_local! {
++    static COPY_CONTEXT: Cell<CopyContext> = const { Cell::new(CopyContext {
++        cause: 0,
++        texel_bytes: 0,
++        image: vk::Image::null(),
++        shadow: false,
++    }) };
++}
++
++/// CopyScope carries the current shadow operation through its synchronous copy helpers.
++/// The saved scalar context is restored when recording leaves that operation.
++pub(crate) struct CopyScope {
++    previous: CopyContext,
++    active: bool,
++}
++
++impl Drop for CopyScope {
++    fn drop(&mut self) {
++        if self.active {
++            COPY_CONTEXT.with(|context| context.set(self.previous));
++        }
++    }
++}
++
++struct ShadowIdentity {
++    texture: u64,
++    image: vk::Image,
++    texel_bytes: u64,
++    row_pitch: u64,
++}
++
++struct ShadowReason {
++    code: u64,
++    text: String,
++}
++
++/// ShadowMetadata keeps the texture identity and the allocation's recorded refusal.
++/// Each capture receives that description when a copy first uses the object.
++/// Copy records join the driver's existing GPU timestamps by their operation ID.
++#[derive(Default)]
++pub(crate) struct ShadowMetadata {
++    identity: OnceLock<ShadowIdentity>,
++    reason: OnceLock<ShadowReason>,
++    generation: AtomicU32,
++}
++
++impl ShadowMetadata {
++    pub(crate) fn name(&self, texture: u64, image: vk::Image, texel_bytes: u64, row_pitch: u64) {
++        let _ = self.identity.set(ShadowIdentity {
++            texture,
++            image,
++            texel_bytes,
++            row_pitch,
++        });
++    }
++
++    pub(crate) fn refused(&self, code: u64, text: String) {
++        let _ = self.reason.set(ShadowReason { code, text });
++    }
++
++    pub(crate) fn scope(
++        &self,
++        trace: Option<Trace>,
++        command_buffer: vk::CommandBuffer,
++        buffer: vk::Buffer,
++        cause: u32,
++    ) -> CopyScope {
++        let Some(trace) = trace.filter(|trace| trace.enabled()) else {
++            return CopyScope {
++                previous: CopyContext::default(),
++                active: false,
++            };
++        };
++        let generation = trace.generation();
++        if generation != 0 && self.generation.swap(generation, Ordering::Relaxed) != generation {
++            if let Some(identity) = self.identity.get() {
++                let code = self.reason.get().map_or(0, |reason| reason.code);
++                trace.emit(command_buffer, 12, 1, [
++                    identity.texture, identity.image.as_raw(), buffer.as_raw(), code,
++                ]);
++                trace.emit(command_buffer, 13, 0, [
++                    identity.image.as_raw(), identity.row_pitch, 0, 0,
++                ]);
++                if let Some(reason) = self.reason.get() {
++                    for (index, chunk) in reason.text.as_bytes().chunks(16).take(16).enumerate() {
++                        let mut bytes = [0u8; 16];
++                        bytes[..chunk.len()].copy_from_slice(chunk);
++                        let mut low = [0u8; 8];
++                        let mut high = [0u8; 8];
++                        low.copy_from_slice(&bytes[..8]);
++                        high.copy_from_slice(&bytes[8..]);
++                        trace.emit(command_buffer, 14, 0, [
++                            identity.image.as_raw(),
++                            pair((index * 16) as u64, reason.text.len() as u64),
++                            u64::from_le_bytes(low), u64::from_le_bytes(high),
++                        ]);
++                    }
++                }
++            }
++        }
++        let current = CopyContext {
++            cause,
++            texel_bytes: self.identity.get().map_or(0, |identity| identity.texel_bytes),
++            image: self.identity.get().map_or(vk::Image::null(), |identity| identity.image),
++            shadow: true,
++        };
++        CopyScope {
++            previous: COPY_CONTEXT.with(|context| context.replace(current)),
++            active: true,
++        }
++    }
++}
++
++pub(crate) fn shadow_refusal(cause: &crate::in_place::ShadowCause) -> u64 {
++    use crate::in_place::{Refusal, ShadowCause};
++    match cause {
++        ShadowCause::Exact => 1,
++        ShadowCause::RenderTarget => 2,
++        ShadowCause::ShaderWrite => 3,
++        ShadowCause::CheckPending(_) => 4,
++        ShadowCause::CheckFailed(_) => 5,
++        ShadowCause::Unchecked(_) => 6,
++        ShadowCause::Refused(refusal, _) => match refusal {
++            Refusal::Rows => 7,
++            Refusal::Detached => 8,
++            Refusal::Image => 9,
++            Refusal::Pitch => 10,
++            Refusal::Placement => 11,
++            Refusal::Source => 12,
++            Refusal::DmaBuf => 13,
++        },
++    }
++}
++
+ /// Trace holds the optional driver's metadata callbacks for one Vulkan device.
+ /// Calls copy at most four words into the driver's bounded buffer while capture
+ /// is enabled. The driver owns timestamping, capture capacity and transport.
+@@ -62,6 +211,68 @@ impl Trace {
+             unsafe { record(self.device, raw, point, flags, words.as_ptr(), 4) };
+         }
+     }
++
++    /// Copy metadata describes the command about to be recorded. The driver
++    /// associates its operation ID with the existing GPU interval for that copy.
++    pub(crate) fn copy_buffer_to_image(
++        self,
++        command_buffer: vk::CommandBuffer,
++        source: vk::Buffer,
++        destination: vk::Image,
++        regions: &[vk::BufferImageCopy],
++        location: &'static Location<'static>,
++    ) {
++        if !self.enabled() {
++            return;
++        }
++        let context = COPY_CONTEXT.with(Cell::get);
++        let path = location.file();
++        let origin = if context.shadow {
++            1
++        } else if path.ends_with("/blit_texture.rs") {
++            2
++        } else if path.ends_with("/texture.rs") || path.ends_with("/texture/staging_copy.rs") {
++            3
++        } else if path.ends_with("/texture/first_move.rs") {
++            4
++        } else {
++            5
++        };
++        let copy = COPY_ID.fetch_add(1, Ordering::Relaxed);
++        for (index, region) in regions.iter().take(COPY_REGIONS).enumerate() {
++            let flags = index as u32;
++            self.emit(command_buffer, 9, flags, [
++                copy, region.buffer_offset,
++                pair(region.buffer_row_length.into(), region.buffer_image_height.into()),
++                pair(region.image_extent.width.into(), region.image_extent.height.into()),
++            ]);
++            self.emit(command_buffer, 10, flags, [
++                copy,
++                pair(region.image_subresource.aspect_mask.as_raw().into(), region.image_subresource.mip_level.into()),
++                pair(region.image_subresource.base_array_layer.into(), region.image_subresource.layer_count.into()),
++                pair(region.image_extent.depth.into(), region.image_offset.z as u32 as u64),
++            ]);
++            let row_texels = if region.buffer_row_length == 0 {
++                region.image_extent.width
++            } else {
++                region.buffer_row_length
++            };
++            self.emit(command_buffer, 11, flags, [
++                copy,
++                pair(region.image_offset.x as u32 as u64, region.image_offset.y as u32 as u64),
++                if destination == context.image {
++                    u64::from(row_texels).saturating_mul(context.texel_bytes)
++                } else {
++                    0
++                },
++                pair(origin.into(), location.line().into()),
++            ]);
++        }
++        let truncated = u32::from(regions.len() > COPY_REGIONS) << 15;
++        self.emit(command_buffer, 8, origin | (context.cause << 8) | truncated, [
++            copy, source.as_raw(), destination.as_raw(), regions.len() as u64,
++        ]);
++    }
+ }
+ 
+ /// Work names a Metal command buffer, encoder and pipeline while Vulkan commands
+diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
+index e6d852a..1a9dcd2 100644
+--- a/crates/metal2vulkan-runtime/src/shadow.rs
++++ b/crates/metal2vulkan-runtime/src/shadow.rs
+@@ -211,6 +211,8 @@ use std::sync::Arc;
+ 
+ /// What a shadowed texture's copies need: its truth, its shadow, and the copies between them.
+ pub(super) struct ShadowCopies {
++    /// The source texture and its allocation decision, retained for later capture windows.
++    pub(super) trace: crate::gpu_trace::ShadowMetadata,
+     /// What the shadow holds a copy of, and the copies.
+     pub(super) source: ShadowSource,
+     /// The shadow's identity: its image's, or its staging buffer's.
+@@ -1628,6 +1630,26 @@ impl ShadowCopy {
+         gate: Option<Arc<CopyInGate>>,
+     ) {
+         let c = &self.copies;
++        let _trace = device.copy_trace().filter(|trace| trace.enabled()).map(|trace| {
++            let buffer = match &c.source {
++                ShadowSource::Bytes { buffer, .. }
++                | ShadowSource::Converted { buffer, .. }
++                | ShadowSource::YCbCrWrite { buffer, .. } => buffer.raw(),
++                ShadowSource::Image { .. } => vk::Buffer::null(),
++            };
++            let cause = match self.cause {
++                None => 0,
++                Some(CopyCause::First) => 1,
++                Some(CopyCause::BeyondHeld) => 2,
++                Some(CopyCause::Changed(Lost::OtherShadow)) => 3,
++                Some(CopyCause::Changed(Lost::TwoWays)) => 4,
++                Some(CopyCause::Changed(Lost::Written)) => 5,
++                Some(CopyCause::Changed(Lost::Within)) => 6,
++                Some(CopyCause::Changed(Lost::Dropped)) => 7,
++                Some(CopyCause::Bounded) => 8,
++            };
++            c.trace.scope(Some(trace), command_buffer, buffer, cause)
++        });
+         let moves = self.moves.as_deref();
+         let into_shadow = match &self.step {
+             Step::Into => true,
+diff --git a/crates/metal2vulkan-runtime/src/tests/shadow.rs b/crates/metal2vulkan-runtime/src/tests/shadow.rs
+index 3b723a8..8c47ac3 100644
+--- a/crates/metal2vulkan-runtime/src/tests/shadow.rs
++++ b/crates/metal2vulkan-runtime/src/tests/shadow.rs
+@@ -71,6 +71,7 @@ fn shadow_in(
+     bytes: Range<u64>,
+ ) -> Arc<ShadowCopies> {
+     Arc::new(ShadowCopies {
++        trace: crate::gpu_trace::ShadowMetadata::default(),
+         source: ShadowSource::Bytes {
+             buffer: raw,
+             key: buffer,
+@@ -1414,6 +1415,7 @@ fn view_of(image: ResourceKey, levels: Range<u32>, layers: Range<u32>) -> Arc<Sh
+         layers,
+     };
+     Arc::new(ShadowCopies {
++        trace: crate::gpu_trace::ShadowMetadata::default(),
+         source: ShadowSource::Image {
+             image: vk::Image::null(),
+             key: image,
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 520dda7..cb17daf 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -2191,6 +2191,7 @@ impl Device {
+             }
+             _ => false,
+         };
++        let mut trace_refusal = 0;
+         let why = match class {
+             Some(_) if device_copy => String::new(),
+             Some(class) => {
+@@ -2252,6 +2253,7 @@ impl Device {
+                         "the in-place check's texture takes no image in place",
+                     ));
+                 }
++                trace_refusal = crate::gpu_trace::shadow_refusal(&cause);
+                 self.shared().counts.host_texture_shadowed(&cause);
+                 if class == PagesClass::Fresh {
+                     self.shared().counts.shadow_over_fresh_pages();
+@@ -2413,6 +2415,11 @@ impl Device {
+         });
+         let views = (words, unorm);
+         let copies = texels.shadow_copies(image.raw.get(), image.identity, aspects, views)?;
++        if device_copy {
++            copies.trace.refused(14, "The device copies logged host pages into its own texture memory.".to_owned());
++        } else {
++            copies.trace.refused(trace_refusal, why.clone());
++        }
+         // Its copies keep its own image, which it presents again once the bytes lie in pages.
+         self.stand_in_while_detached(&texels.buffer, &image)?;
+         // A device copy degrades nothing: it holds the bytes wherever a command reads them.
+@@ -4105,6 +4112,14 @@ impl Texture {
+             facts: OnceLock::new(),
+             planes_in_place,
+         }));
++        if let Storage::Shadow { image, texels, copies } = &texture.0.storage {
++            let texel_bytes = image.plan().format.block()
++                .filter(|block| block.texels == 1 && block.color.is_some())
++                .map_or(0, |block| u64::from(block.size));
++            copies.trace.name(
++                texture.0.object_id.get(), image.raw.get(), texel_bytes, texels.layout.row_pitch,
++            );
++        }
+         if let Some(objects) = texture.0.storage.objects() {
+             objects.object_made();
+         }
+diff --git a/crates/metal2vulkan-runtime/src/texture/heap.rs b/crates/metal2vulkan-runtime/src/texture/heap.rs
+index 9e09e8e..539dfea 100644
+--- a/crates/metal2vulkan-runtime/src/texture/heap.rs
++++ b/crates/metal2vulkan-runtime/src/texture/heap.rs
+@@ -3386,6 +3386,7 @@ impl Device {
+         own.resource_options = options;
+         self.new_heap_shadow(plan, layout, &own, identity, every, |placement, image| {
+             let copies = ShadowCopies {
++                trace: crate::gpu_trace::ShadowMetadata::default(),
+                 source: ShadowSource::Bytes {
+                     buffer,
+                     key: heap_bytes.key,
+@@ -3491,6 +3492,7 @@ impl Device {
+         own.resource_options = options;
+         self.new_image_as_it_lies(plan, layout, &own, identity, |placement, image| {
+             let copies = ShadowCopies {
++                trace: crate::gpu_trace::ShadowMetadata::default(),
+                 source: ShadowSource::Bytes {
+                     buffer,
+                     key: heap_bytes.key,
+@@ -3569,6 +3571,7 @@ impl Device {
+         own.resource_options = options;
+         self.new_heap_shadow(plan, layout, &own, identity, every, |placement, image| {
+             let copies = ShadowCopies {
++                trace: crate::gpu_trace::ShadowMetadata::default(),
+                 source: ShadowSource::Bytes {
+                     buffer,
+                     key: heap_bytes.key,
+diff --git a/crates/metal2vulkan-runtime/src/texture/surface_depth.rs b/crates/metal2vulkan-runtime/src/texture/surface_depth.rs
+index 8617e0c..280cb97 100644
+--- a/crates/metal2vulkan-runtime/src/texture/surface_depth.rs
++++ b/crates/metal2vulkan-runtime/src/texture/surface_depth.rs
+@@ -148,6 +148,7 @@ impl Texture {
+             let tiles = HeapTiledCopies::new(device, &staging, tiled, shape, &regions, hazard)?;
+             let (truth, tracked) = texels.buffer.tracked(base..end);
+             let copies = ShadowCopies {
++                trace: crate::gpu_trace::ShadowMetadata::default(),
+                 source: ShadowSource::Bytes {
+                     buffer: ShadowBuffer::of(&texels.buffer, raw),
+                     key: truth.key,
+diff --git a/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs b/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs
+index 1c69338..ee73e6f 100644
+--- a/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs
++++ b/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs
+@@ -224,6 +224,7 @@ impl Device {
+             .buffer
+             .tracked(color.offset..color.offset + planes.span());
+         let copies = ShadowCopies {
++            trace: crate::gpu_trace::ShadowMetadata::default(),
+             source: ShadowSource::Bytes {
+                 buffer: ShadowBuffer::of(&texels.buffer, raw),
+                 key: bytes.key,
+diff --git a/crates/metal2vulkan-runtime/src/texture/view_shadow.rs b/crates/metal2vulkan-runtime/src/texture/view_shadow.rs
+index 654c899..a97c522 100644
+--- a/crates/metal2vulkan-runtime/src/texture/view_shadow.rs
++++ b/crates/metal2vulkan-runtime/src/texture/view_shadow.rs
+@@ -467,6 +467,7 @@ impl Device {
+         let image =
+             self.new_image_owned(plan, &layout, &descriptor, identity, |placement, raw| {
+                 let copies = ShadowCopies {
++                    trace: crate::gpu_trace::ShadowMetadata::default(),
+                     source: ShadowSource::Image {
+                         image: truth,
+                         key: truth_key,
+diff --git a/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs b/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
+index 0474694..0bdda1b 100644
+--- a/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
++++ b/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
+@@ -369,6 +369,7 @@ impl Device {
+         let conversion = YCbCrConversion::new(self, (planes, span.clone()), (raw, at), view)?;
+         let (bytes, tracked) = texels.buffer.tracked(span);
+         let copies = ShadowCopies {
++            trace: crate::gpu_trace::ShadowMetadata::default(),
+             source: ShadowSource::Converted {
+                 buffer: ShadowBuffer::of(&texels.buffer, raw),
+                 key: bytes.key,
+@@ -682,6 +683,7 @@ impl Texture {
+             YCbCrWriteBack::new(device, (&planes, span.clone()), at, (view, false), None)?;
+         let (bytes, tracked) = texels.buffer.tracked(span);
+         let copies = ShadowCopies {
++            trace: crate::gpu_trace::ShadowMetadata::default(),
+             source: ShadowSource::YCbCrWrite {
+                 buffer: ShadowBuffer::of(&texels.buffer, raw),
+                 key: bytes.key,
+@@ -850,6 +852,7 @@ impl Texture {
+         )?;
+         let (bytes, tracked) = texels.buffer.tracked(span);
+         let copies = ShadowCopies {
++            trace: crate::gpu_trace::ShadowMetadata::default(),
+             source: ShadowSource::YCbCrWrite {
+                 buffer: ShadowBuffer::of(&texels.buffer, raw),
+                 key: bytes.key,

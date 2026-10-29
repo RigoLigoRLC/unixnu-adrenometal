@@ -19,6 +19,9 @@ actions, changed texture bindings and actual draw pipeline identities to Turnip'
 bounded GPU capture buffer. Deferred draws retain their Metal identities until
 their Vulkan commands are recorded. The driver owns capture control and export;
 the fixed metadata layout is documented in [bridge/TRACE_METADATA.md](bridge/TRACE_METADATA.md).
+Buffer-to-image copies also record their source and destination handles, regions
+and runtime origin. Shadow textures retain their allocation refusal and publish
+it in each capture window where they are used, with the texture identity.
 
 The runtime keeps separate buffer and image memory pools for each Vulkan memory
 type. Pool growth is serialized independently of existing allocations and
