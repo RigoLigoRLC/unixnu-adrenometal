@@ -519,7 +519,7 @@ index 8495e82f..cd2edc94 100644
                  instance.rerecord = None;
              }
              if split {
-+                let same_shape = self.current.shape == instance.shape;
++                let same_shape = *self.current.shape == *instance.shape;
                  let cause = match (self.barrier, self.dispatched) {
                      (true, _) => Split::Barrier,
                      (false, true) => Split::TileDispatch,
