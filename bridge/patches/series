@@ -25,3 +25,4 @@
 0025-gpu-capture-copy-source-metadata.patch
 0026-order-internal-copy-groups-and-capture-pass-splits.patch
 0027-discard-inline-first-copy-summary.patch
+0028-defer-pass-begin-for-memoryless-colors.patch

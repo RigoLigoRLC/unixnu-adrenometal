@@ -1,0 +1,114 @@
+diff --git a/crates/metal2vulkan-runtime/src/render/inline_first.rs b/crates/metal2vulkan-runtime/src/render/inline_first.rs
+index c373211..3993f5b 100644
+--- a/crates/metal2vulkan-runtime/src/render/inline_first.rs
++++ b/crates/metal2vulkan-runtime/src/render/inline_first.rs
+@@ -24,9 +24,9 @@
+ //!   (`Texture::image_over_buffer`; not a texture buffer, a shadow, a stand-in while the bytes
+ //!   are detached, or a bound linear image), of no extended-range, padded or bfloat format,
+ //!   with no resolve or stand-in, loaded `Load` or `Clear` (of no NaN the device must clear
+-//!   apart) and stored `Store`; or a memoryless texture's own transient image loaded and stored
+-//!   `DontCare` (below). Then the end changes none of the first instance's load and store
+-//!   operations (`render_target::final_pass` stores every attachment of an instance that is not
++//!   apart) and stored `Store`. Encoders with a memoryless color record their draws in
++//!   secondary command buffers (below). Then the end changes none of the first instance's load
++//!   and store operations (`render_target::final_pass` stores every attachment of an instance that is not
+ //!   the last; so does the last here, and `kept_bytes.rs` keeps a stored attachment in place),
+ //!   its attachments or its clear values.
+ //! - **A clear past the render area.** Metal's `Clear` load reaches past the render area, to
+@@ -43,23 +43,14 @@
+ //!   must ensure (using scissor if necessary) that all rendering is contained within the render
+ //!   area" asks. The end then records no reach clear for the pass, and a stand-in arriving later
+ //!   is copied into over the reach, as its copy back covers it.
+-//! - **A memoryless color** is rendered in place by the instance recorded inline, in its own
+-//!   transient image, of a 2D level and layer whose format takes transfer writes. Metal's pass
+-//!   neither loads nor stores it, and a fragment that reads it before any draw wrote it reads zero
+-//!   (`clear_reach::dont_care_loads`, which the end applies where the pass draws): the instance
+-//!   clears it to zero and stores it `DontCare`, a last instance's store, whether or not
+-//!   instances follow. Where no draw reaches a tile, no fragment reads it, so the clear is
+-//!   Metal's answer either way. The end stores every attachment of an instance before the last,
+-//!   and a split pass renders its memoryless colors into backings that keep them between its
+-//!   instances (`attachment_stand_in.rs`); here no store is needed, since no draw writes the
+-//!   transient image: what the instance leaves is its clear, which the backing arriving later is
+-//!   given, cleared to it right after the instance (`Clears`), never copied
+-//!   (`StandIn::copies`). So the first draw that records rules the instance out where it writes
+-//!   a memoryless color (a pass color the texture renders in place, under a write mask that
+-//!   keeps a channel: `RenderCommandEncoder::writes_memoryless`), and a later draw that writes
+-//!   one splits the pass before it: the draw records into a new instance, from which on the
+-//!   backing the split brings stands in. That instance records inline too where it can, its
+-//!   backings cleared before it in place of after the first (`render/inline_splits.rs`).
++//! - **An encoder with a memoryless color** records its draws in secondary command buffers.
++//!   Its primary render pass begins at the encoder's end, when every draw's writes and the
++//!   attachment's required lifetime are known. Draws before and after the first write can share
++//!   one instance. Its clear and store operations are then chosen by the normal pass planner.
++//!   If a shader read, shape change or other dependency splits the pass, the planner can render
++//!   every instance into the backing chosen for that attachment (`attachment_stand_in.rs`).
++//!   Starting a transient attachment inline with a `DontCare` store would commit its discard
++//!   before later draws reveal whether its contents must survive another instance.
+ //! - **Bytes over host pages** that an attachment lies in may be detached or rebound while the
+ //!   pass is open (`detach.rs`, `rebind.rs`), which swaps its images out from under the
+ //!   framebuffer the first instance recorded with. The pass holds those bytes from its open, as
+@@ -220,44 +211,27 @@ pub(super) fn opens_inline(
+         let target = &color.target;
+         let texture = &target.texture;
+         let unresolved = color.resolve.is_none() && color.copied_resolve.is_none();
+-        // A memoryless color, neither loaded nor stored: its own transient image in place, of a
+-        // 2D level and layer that a backing arriving later takes, cleared by transfer (the module
+-        // docs).
++        // Secondary recording lets the pass planner choose the attachment's backing and store
++        // action after all draws, so its first write does not force a new render pass instance.
+         if color.memoryless || super::memoryless(target) {
+-            let profile = device.compile_device().profile();
+-            let formats = device.shared().textures.facts(profile);
+-            let unheld = color.load == LoadAction::DontCare
+-                && color.store == StoreAction::DontCare
+-                && !color.late_store
+-                && unresolved
+-                && !crate::render_pass::not_2d(target)
+-                && formats
+-                    .optimal(target.format)
+-                    .contains(metal2vulkan::vk::FormatFeatureFlags2::TRANSFER_DST);
+-            if !unheld {
+-                return Err(NotInline::Memoryless);
+-            }
+-            // Large enough for the framebuffer over the pass's reach.
+-            if (0..2).any(|axis| target.extent[axis] < area[axis]) {
+-                return Err(NotInline::Actions(ActionsRefused::UnequalReach));
+-            }
+-        } else {
+-            // Loaded where the instance renders over the render area, or cleared over the reach
+-            // it renders over to a value the clear keeps; resolved nowhere; stored by `Store`, not
+-            // late. Else the first action ruled out.
+-            let loaded = match color.load {
+-                LoadAction::Load => (area != layout.extent).then_some(ActionsRefused::UnequalReach),
+-                LoadAction::Clear => (clear_reach::cleared(layout, target.extent, true) != area)
+-                    .then_some(ActionsRefused::UnequalReach),
+-                LoadAction::DontCare => Some(ActionsRefused::DontCareLoad),
+-            };
+-            let refused = loaded
+-                .or((!unresolved).then_some(ActionsRefused::Resolve))
+-                .or((color.store != StoreAction::Store || color.late_store)
+-                    .then_some(ActionsRefused::Store));
+-            if let Some(refused) = refused {
+-                return Err(NotInline::Actions(refused));
+-            }
++            return Err(NotInline::Memoryless);
++        }
++
++        // Loaded where the instance renders over the render area, or cleared over the reach
++        // it renders over to a value the clear keeps; resolved nowhere; stored by `Store`, not
++        // late. Else the first action ruled out.
++        let loaded = match color.load {
++            LoadAction::Load => (area != layout.extent).then_some(ActionsRefused::UnequalReach),
++            LoadAction::Clear => (clear_reach::cleared(layout, target.extent, true) != area)
++                .then_some(ActionsRefused::UnequalReach),
++            LoadAction::DontCare => Some(ActionsRefused::DontCareLoad),
++        };
++        let refused = loaded
++            .or((!unresolved).then_some(ActionsRefused::Resolve))
++            .or((color.store != StoreAction::Store || color.late_store)
++                .then_some(ActionsRefused::Store));
++        if let Some(refused) = refused {
++            return Err(NotInline::Actions(refused));
+         }
+         if texture.over_buffer() && !texture.image_over_buffer() {
+             return Err(NotInline::BufferTextures);

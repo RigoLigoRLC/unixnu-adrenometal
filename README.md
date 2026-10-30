@@ -35,6 +35,13 @@ index and split reason. Copy groups also record their copy and barrier counts
 and the number of staged row dispatches. Attachment feedback and shader reads
 that require a separate pass retain their existing ordering.
 
+Render encoders with a memoryless color attachment record their draws in the
+existing secondary command buffers. The primary render pass starts after the
+encoder has recorded every draw, when its attachment backing and store actions
+are known. Draws before and after the attachment's first write can therefore
+share one pass. Dependencies that require multiple instances still use the
+runtime's existing attachment backing and preservation rules.
+
 The runtime keeps separate buffer and image memory pools for each Vulkan memory
 type. Pool growth is serialized independently of existing allocations and
 releases. An allocator that waited for growth searches the pool again before
