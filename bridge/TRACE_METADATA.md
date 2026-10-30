@@ -114,3 +114,50 @@ means that value was not retained. Zero row stride in type 11 means the copy's
 destination format must supply its texel size; the runtime computes it only for
 a known uncompressed color shadow image. The producer retains its fixed capacity
 and performs transport on its existing worker.
+
+## Internal render passes and copy dependencies
+
+The runtime records type 15 immediately before each actual Vulkan render pass
+begin, including inline recording, deferred passes, indirect execution runs and
+resolve-only passes. Turnip associates the marker with that begin and the
+attachment actions it actually emits. Repeated runs of one instance retain the
+same instance index and acquire the execution reason bit.
+
+| Type | Name | Word 0 | Word 1 | Word 2 | Word 3 |
+| --- | --- | --- | --- | --- | --- |
+| 15 | Internal render pass | Encoder ID | Instance index | Split reason bits | Copy count, barrier count |
+| 17 | Internal copy dependencies | Encoder ID | Instance index | Copy count, barrier count | Staged row dispatch count |
+
+The instance index starts at zero within the Metal encoder. Type 15 uses flags
+zero. The first instance has reason bits zero. A later instance records the
+reason selected by the existing split decision; replacement recordings keep
+that reason. Bit assignments are:
+
+| Bit | Reason |
+| --- | --- |
+| 0 | Explicit memory barrier |
+| 1 | Tile dispatch |
+| 2 | Tile threadgroup memory ordering |
+| 3 | Sampling an attached texture after an in-pass barrier |
+| 4 | Attachment feedback layout or snapshot requirement |
+| 5 | Writing a memoryless attachment after inline recording |
+| 6 | Pipeline compilation still pending |
+| 7 | Indirect execution or an additional run of an instance |
+| 8 | Visibility query mode |
+| 9 | Attachment shape, view, format or shader-side test change |
+| 10 | Resolve-only pass after the draw instances |
+
+Counts use the same low/high 32-bit pair encoding as the earlier types. The
+barrier count includes dependencies between copies and the group's final
+dependency before later work. It excludes the caller's dependency from the
+preceding render pass and barriers inside a copy's own implementation. A count
+of `0xffffffff` means the encoder core recorded those operations separately:
+the first inline begin has both counts unavailable, and other core paths have
+an unavailable barrier count. Zero means the measured path recorded none.
+
+Type 17 is emitted once after each nonempty copy group recorded by PassSteps.
+Flag 0 names copies before the indicated instance. Flag 1 names copies before a
+tile dispatch after that instance. Its row dispatch count includes only the
+staged-row operations selected as compute; a shadow operation can contain other
+compute work. These counts describe command recording, while the driver's GPU
+events describe execution and tile replay. Type 16 is reserved.

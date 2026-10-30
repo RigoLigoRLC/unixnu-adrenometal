@@ -23,6 +23,18 @@ Buffer-to-image copies also record their source and destination handles, regions
 and runtime origin. Shadow textures retain their allocation refusal and publish
 it in each capture window where they are used, with the texture identity.
 
+Copies between internal render passes use the runtime's resource and range
+tracker, including overlapping host imports. Independent copies share one final
+dependency; a copy that reads or writes an earlier copy's range receives the
+required intermediate dependency. Staged row copies contribute their actual
+compute accesses. The final dependency exports writes from the stages that
+recorded the copies and orders their reads before subsequent writes.
+
+Every actual internal render pass begin records its Metal encoder, instance
+index and split reason. Copy groups also record their copy and barrier counts
+and the number of staged row dispatches. Attachment feedback and shader reads
+that require a separate pass retain their existing ordering.
+
 The runtime keeps separate buffer and image memory pools for each Vulkan memory
 type. Pool growth is serialized independently of existing allocations and
 releases. An allocator that waited for growth searches the pool again before

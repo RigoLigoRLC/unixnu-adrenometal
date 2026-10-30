@@ -1,0 +1,595 @@
+diff --git a/crates/metal2vulkan-runtime/src/gpu_trace.rs b/crates/metal2vulkan-runtime/src/gpu_trace.rs
+index 5b6fc01..b8fb0f4 100644
+--- a/crates/metal2vulkan-runtime/src/gpu_trace.rs
++++ b/crates/metal2vulkan-runtime/src/gpu_trace.rs
+@@ -297,7 +297,57 @@ pub(crate) struct RecordedMetadata {
+     vulkan_pipeline: vk::Pipeline,
+ }
+ 
++/// CopySynchronization counts the copies and dependencies recorded before one internal pass.
++/// The row count names copies whose staged rows run as compute dispatches. A count of
++/// `u32::MAX` means that path recorded its copies separately from this pass marker.
++#[derive(Clone, Copy, Default)]
++pub(crate) struct CopySynchronization {
++    pub(crate) copies: u32,
++    pub(crate) barriers: u32,
++    pub(crate) row_dispatches: u32,
++}
++
+ impl Work {
++    pub(crate) fn internal_pass(
++        self,
++        raw: vk::CommandBuffer,
++        index: usize,
++        reasons: u64,
++        synchronization: CopySynchronization,
++    ) {
++        self.trace.emit(
++            raw,
++            15,
++            0,
++            [
++                self.encoder,
++                index as u64,
++                reasons,
++                pair(synchronization.copies.into(), synchronization.barriers.into()),
++            ],
++        );
++    }
++
++    pub(crate) fn copy_synchronization(
++        self,
++        raw: vk::CommandBuffer,
++        index: usize,
++        flags: u32,
++        synchronization: CopySynchronization,
++    ) {
++        self.trace.emit(
++            raw,
++            17,
++            flags,
++            [
++                self.encoder,
++                index as u64,
++                pair(synchronization.copies.into(), synchronization.barriers.into()),
++                synchronization.row_dispatches.into(),
++            ],
++        );
++    }
++
+     pub(crate) fn map(self, raw: vk::CommandBuffer, kind: u64) {
+         self.trace.emit(
+             raw,
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index dbe8b58..74a6e50 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -1035,6 +1035,8 @@ impl InterlockedStorage {
+ 
+ /// One render pass instance of an encoder's pass (the module docs).
+ struct Instance {
++    /// The captured reason this instance follows another instance of the Metal encoder.
++    split_reason: u64,
+     /// The secondary command buffer its draws record into, against `compatible`. Null for a
+     /// pass's first instance that may record inline until a command records into it or a split
+     /// keeps it (`RenderCommandEncoder::begin_current_draws`), for a new instance until the
+@@ -1949,6 +1951,7 @@ impl RenderLowering {
+             traced_pass_generation: 0,
+             earlier: Vec::new(),
+             current: Instance {
++                split_reason: 0,
+                 draws,
+                 shape: Versioned::new(shape.clone()),
+                 compatible: Arc::clone(&compatible),
+@@ -5201,6 +5204,7 @@ impl RenderLowering {
+             .enumerate()
+         {
+             let Instance {
++                split_reason,
+                 draws,
+                 shape,
+                 shadow: shadowed,
+@@ -5223,6 +5227,7 @@ impl RenderLowering {
+                 return Err(internal("an execution in an instance of moved attachments"));
+             }
+             instance_steps.push(InstanceSteps {
++                split_reason,
+                 shadow: shadowed,
+                 shader_tests,
+                 shadow_fills,
+@@ -5238,6 +5243,7 @@ impl RenderLowering {
+         }
+         let mut dispatch_copies = dispatch_copies.into_iter();
+         let steps = PassSteps {
++            trace: core.trace_work(0),
+             instances: instance_steps,
+             family: core.queue_flags(),
+             reload_at,
+@@ -5245,6 +5251,9 @@ impl RenderLowering {
+             reloads: merged.iter().map(|(_, merge)| Arc::clone(merge)).collect(),
+             published,
+             texel_copies: later_texel_copies,
++            first_texel_count: first_texel_copies
++                .as_ref()
++                .map_or(0, |copies| copies.len() as u32),
+             planes,
+             shadow_copies,
+             stand_in_copies,
+@@ -5336,8 +5345,14 @@ impl RenderLowering {
+                             if index > 0 {
+                                 steps.barrier_before(index).record(raw, command_buffer);
+                             }
+-                            steps.before(raw, command_buffer, index);
+-                            steps.begin(raw, command_buffer, index, pass.raw, framebuffer.raw);
++                            let synchronization = steps.before(raw, command_buffer, index);
++                            steps.begin(
++                                raw,
++                                command_buffer,
++                                (index, 0, synchronization),
++                                pass.raw,
++                                framebuffer.raw,
++                            );
+                             // An instance whose secondary never began recorded nothing: its
+                             // render pass instance runs its loads and stores alone.
+                             if *draws != vk::CommandBuffer::null() {
+@@ -6164,6 +6179,7 @@ impl RenderLowering {
+         // Its secondary begins where its caller installs it, but where it records inline
+         // after a split (`begin_new_draws`).
+         let instance = Instance {
++            split_reason: 0,
+             draws: vk::CommandBuffer::null(),
+             shape: Versioned::new(shape),
+             compatible,
+@@ -6279,6 +6295,7 @@ impl RenderLowering {
+         let compatible = Arc::clone(&self.current.compatible);
+         let draws = self.core.command_buffer().begin_draws(&compatible)?;
+         let instance = Instance {
++            split_reason: 0,
+             draws,
+             shape: Versioned::new(self.current.shape.clone()),
+             compatible,
+@@ -6369,6 +6386,7 @@ impl RenderLowering {
+                     (false, false) => cause,
+                 };
+                 self.core.device().shared().counts.instance_split(cause);
++                instance.split_reason = cause.trace_bit();
+                 let previous = std::mem::replace(&mut self.current, *instance);
+                 self.earlier.push(previous);
+                 self.barrier_splits += usize::from(self.barrier);
+@@ -6383,6 +6401,7 @@ impl RenderLowering {
+             } else {
+                 // It takes the place of the current one, whose draws it records again.
+                 let mut instance = *instance;
++                instance.split_reason = self.current.split_reason;
+                 instance.drawn.join(&self.current.drawn);
+                 let replaced = std::mem::replace(&mut self.current, instance);
+                 self.end_unrun(replaced);
+diff --git a/crates/metal2vulkan-runtime/src/work_counts.rs b/crates/metal2vulkan-runtime/src/work_counts.rs
+index a0cdfd8..5aa1f8e 100644
+--- a/crates/metal2vulkan-runtime/src/work_counts.rs
++++ b/crates/metal2vulkan-runtime/src/work_counts.rs
+@@ -533,6 +533,22 @@ pub(crate) enum Split {
+ impl Split {
+     /// How many there are.
+     pub(crate) const COUNT: usize = 10;
++
++    /// The fixed capture bit for this reason, independent of the counter array's order.
++    pub(crate) fn trace_bit(self) -> u64 {
++        1 << match self {
++            Split::Barrier => 0,
++            Split::TileDispatch => 1,
++            Split::TileMemory => 2,
++            Split::AttachedRead => 3,
++            Split::Feedback => 4,
++            Split::MemorylessWrite => 5,
++            Split::PendingPipeline => 6,
++            Split::Execution => 7,
++            Split::Visibility => 8,
++            Split::Shape => 9,
++        }
++    }
+ }
+ 
+ /// What kept a render pass's first instance from recording inline (`render/inline_first.rs`): the
+diff --git a/crates/metal2vulkan-runtime/src/render/pass_steps.rs b/crates/metal2vulkan-runtime/src/render/pass_steps.rs
+index b18876b..ded07c0 100644
+--- a/crates/metal2vulkan-runtime/src/render/pass_steps.rs
++++ b/crates/metal2vulkan-runtime/src/render/pass_steps.rs
+@@ -9,9 +9,9 @@
+ //!   (`render_target::moved_barriers`).
+ //! - **Before each instance**: after a memory barrier, the colors over a buffer's bytes that
+ //!   render through copied stand-ins merged back and copied in again, or copied back
+-//!   (`linear_merge.rs`); after the first, the shadowed textures' copies into it, each before a
+-//!   barrier to what follows (`render/shadows.rs`, their rows back out of a staging buffer a copy
+-//!   of rows, [`StagedRows`]); its sample planes' steps (`sample_planes.rs`);
++//!   (`linear_merge.rs`); after the first, the shadowed textures' copies into it, ordered by their
++//!   overlapping reads and writes, then a barrier to what follows (`render/shadows.rs`, their
++//!   staged rows copied back through [`StagedRows`]); its sample planes' steps (`sample_planes.rs`);
+ //!   where its draws test the stencil in the shader, the shadow's filling (`shadow_stencil.rs`),
+ //!   and where they test the depth there, the depth stand-in's (`depth_stand_in.rs`); where its
+ //!   draws first hold an extended-range color's `half` shadow, the shadow's setting
+@@ -39,6 +39,7 @@ use crate::attachment_stand_in::StandInCopies;
+ use crate::depth_stand_in::StandInCopies as DepthStandInCopies;
+ use crate::device::functions::Vk;
+ use crate::device::lock;
++use crate::gpu_trace::{CopySynchronization, Work};
+ use crate::owned_kernel::OwnedSets;
+ use crate::pipeline::RawPipeline;
+ use crate::render_target::{self, ClearValues, FramebufferObject, MovedImage, RenderPassObject};
+@@ -47,14 +48,16 @@ use crate::row_copies::RowCopies;
+ use crate::sample_planes::PlanesCommands;
+ use crate::shadow::ShadowCopy;
+ use crate::shadow_stencil::ShadowCopies;
+-use crate::tracker::Barrier;
++use crate::tracker::{Access, Barrier, EncoderUses, Reach};
+ use crate::work_counts::PassBegun;
+ use crate::Device;
+ use ash::vk;
+ use std::sync::{Arc, Mutex};
+ 
+-/// What one render pass instance records before and after it, past its draws.
++/// InstanceSteps holds one render pass instance's operations before and after its draws.
+ pub(super) struct InstanceSteps {
++    /// The reason this instance follows another instance of the Metal encoder.
++    pub(super) split_reason: u64,
+     /// Its draws test and write the stencil in the shader: the shadow is filled before it and
+     /// copied back after it.
+     pub(super) shadow: bool,
+@@ -88,23 +91,21 @@ pub(super) struct StagedDispatch {
+     pub(super) copies: Vec<ShadowCopy>,
+ }
+ 
+-/// The copies of rows that move the shadowed textures' staged rows back into their buffers'
+-/// bytes in the steps (`ShadowCopy::staged_back`, `row_copies.rs`), each made on `device` as its
+-/// copy records, over its buffer's `VkBuffer` as the copy reads it (a buffer over host pages a
+-/// rebind moves has another by the time a pass that records later records). Each between
+-/// barriers from everything before it and to everything after it, whose scopes take a dispatch's
+-/// accesses as well as a copy's, so the pass's uses name the copies' as copies
+-/// (`ShadowCopy::uses`). `sets` holds the sets of those that bind one of their own, with the
+-/// steps, until the command buffer completes.
++/// StagedRows retains descriptor sets for operations that copy staged texels into buffer rows.
++/// Each operation is created when the copy records, using the buffer's current Vulkan handle
++/// after any host-page rebind. The dependency tracker receives its actual transfer or compute
++/// accesses, and the command buffer retains the sets until completion.
+ pub(super) struct StagedRows {
+     pub(super) device: Device,
++    /// Descriptor sets owned by row dispatches recorded through these steps.
+     pub(super) sets: Mutex<Vec<OwnedSets>>,
+ }
+ 
+-/// The steps around a pass's render pass instances (the module docs), planned as the encoder
+-/// ends. They hold the objects they record until the command buffer completes: the encoder
+-/// retains them, or the pass that records later does.
++/// PassSteps owns the copies, attachment transitions and auxiliary work around an encoder's
++/// internal render passes. The encoder builds these steps as it ends and retains them through
++/// GPU completion, either directly or with the pass that records later.
+ pub(super) struct PassSteps {
++    pub(super) trace: Work,
+     pub(super) instances: Vec<InstanceSteps>,
+     /// The flags of the queue family that records the pass, for which its image barriers are made
+     /// (`image_barrier.rs`).
+@@ -119,6 +120,8 @@ pub(super) struct PassSteps {
+     pub(super) published: Option<StandInCopies>,
+     /// The shadowed textures' copies before each instance past the first, in order.
+     pub(super) texel_copies: Vec<Vec<ShadowCopy>>,
++    /// Copies recorded by the encoder core before the first instance's steps.
++    pub(super) first_texel_count: u32,
+     pub(super) planes: Option<PlanesCommands>,
+     /// The copies between the stencil and its shader-side shadow.
+     pub(super) shadow_copies: Option<ShadowCopies>,
+@@ -139,6 +142,15 @@ pub(super) struct PassSteps {
+ 
+ impl PassSteps {
+     pub(super) fn barrier_before(&self, instance: usize) -> Barrier {
++        let copies = instance
++            .checked_sub(1)
++            .and_then(|index| self.texel_copies.get(index));
++        if copies.is_some_and(|copies| !copies.is_empty()) {
++            // These copies read the previous instance before the draw stages named by an
++            // explicit shader barrier, so its destination must include transfer and compute.
++            return Barrier::everything();
++        }
++
+         self.barriers
+             .get(&instance)
+             .copied()
+@@ -153,7 +165,21 @@ impl PassSteps {
+     /// `command_buffer` is recording outside a render pass, and only the caller records it;
+     /// every object the steps name is live until it completes, and every image rests in
+     /// `GENERAL`.
+-    pub(super) unsafe fn before(&self, raw: &Vk, command_buffer: vk::CommandBuffer, index: usize) {
++    pub(super) unsafe fn before(
++        &self,
++        raw: &Vk,
++        command_buffer: vk::CommandBuffer,
++        index: usize,
++    ) -> CopySynchronization {
++        let mut synchronization = if index == 0 && self.first_texel_count > 0 {
++            CopySynchronization {
++                copies: self.first_texel_count,
++                barriers: u32::MAX,
++                row_dispatches: 0,
++            }
++        } else {
++            CopySynchronization::default()
++        };
+         // SAFETY: the caller's contract.
+         unsafe {
+             if self.reload_at.contains(&index) {
+@@ -165,9 +191,10 @@ impl PassSteps {
+                 }
+             }
+             let texels = index.checked_sub(1).and_then(|i| self.texel_copies.get(i));
+-            for copy in texels.into_iter().flatten() {
+-                self.copy(raw, command_buffer, copy);
+-                Barrier::everything().record(raw, command_buffer);
++            if let Some(copies) = texels.filter(|copies| !copies.is_empty()) {
++                synchronization = self.copies(raw, command_buffer, copies);
++                self.trace
++                    .copy_synchronization(command_buffer, index, 0, synchronization);
+             }
+             if let Some(planes) = &self.planes {
+                 planes.record(raw, command_buffer, index);
+@@ -191,6 +218,8 @@ impl PassSteps {
+                 }
+             }
+         }
++
++        synchronization
+     }
+ 
+     /// Begin instance `index` in `pass` and `framebuffer` (one of its runs, where an execution
+@@ -206,7 +235,7 @@ impl PassSteps {
+         &self,
+         raw: &ash::Device,
+         command_buffer: vk::CommandBuffer,
+-        index: usize,
++        (index, run, synchronization): (usize, usize, CopySynchronization),
+         pass: vk::RenderPass,
+         framebuffer: vk::Framebuffer,
+     ) {
+@@ -225,6 +254,13 @@ impl PassSteps {
+                 .framebuffer(framebuffer)
+                 .render_area(self.render_area)
+                 .clear_values(self.clear_values.as_slice());
++            let reason = self
++                .instances
++                .get(index)
++                .map_or(0, |instance| instance.split_reason)
++                | if run > 0 { 1 << 7 } else { 0 };
++            self.trace
++                .internal_pass(command_buffer, index, reason, synchronization);
+             raw.cmd_begin_render_pass(
+                 command_buffer,
+                 &begin,
+@@ -328,11 +364,11 @@ impl PassSteps {
+                 .zip(tiles)
+                 .filter(|(s, _)| s.dispatch.after == index + 1)
+             {
+-                // Its shadowed textures' copies, each after a barrier from what precedes it; the
+-                // dispatch begins with another.
+-                for copy in &staged.copies {
++                if !staged.copies.is_empty() {
+                     Barrier::everything().record(raw, command_buffer);
+-                    self.copy(raw, command_buffer, copy);
++                    let synchronization = self.copies(raw, command_buffer, &staged.copies);
++                    self.trace
++                        .copy_synchronization(command_buffer, index, 1, synchronization);
+                 }
+                 staged
+                     .dispatch
+@@ -341,21 +377,70 @@ impl PassSteps {
+         }
+     }
+ 
+-    /// Record a shadowed texture's `copy`, its staged rows back as a copy of rows made now
+-    /// ([`StagedRows`]).
++    /// Record `copies` after the caller's dependency from earlier pass work. Each copy's uses
++    /// include the host ranges that alias its backing and the actual staged row dispatch.
++    /// The tracker looks up only those keys, keeping at most eight ranges per key. Independent
++    /// copies run together; overlapping reads and writes receive the dependency they need.
++    /// One final barrier exports their writes and orders their reads before subsequent work.
+     ///
+     /// # Safety
+     ///
+-    /// As for [`PassSteps::before`], between a barrier from everything before and one to
+-    /// everything after.
+-    unsafe fn copy(&self, raw: &Vk, command_buffer: vk::CommandBuffer, copy: &ShadowCopy) {
+-        let rows = copy.staged_back(&self.staged_rows.device);
+-        // SAFETY: the caller's contract; the rows are the copy's own, made just now over its
+-        // buffer's `VkBuffer`.
+-        unsafe { copy.record(raw, command_buffer, rows.as_ref()) };
+-        if let Some(sets) = rows.and_then(RowCopies::retained) {
+-            lock(&self.staged_rows.sets).push(sets);
++    /// As for [`PassSteps::before`], after a barrier from everything before.
++    unsafe fn copies(
++        &self,
++        raw: &Vk,
++        command_buffer: vk::CommandBuffer,
++        copies: &[ShadowCopy],
++    ) -> CopySynchronization {
++        let device = &self.staged_rows.device;
++        let mut tracker = EncoderUses::new(true);
++        let mut aliased = Vec::new();
++        let mut source = Access::NONE;
++        let mut synchronization = CopySynchronization::default();
++
++        for copy in copies {
++            let rows = copy.staged_back(device);
++            let stages = copy.stages_with(rows.as_ref());
++            let uses = copy.uses_with(rows.as_ref());
++            let uses = if device.shared().aliases.augment_into(&uses, &mut aliased) {
++                &aliased[..]
++            } else {
++                &uses[..]
++            };
++            let barrier = tracker.barrier(uses, Reach::Named);
++            if let Some(barrier) = barrier {
++                // SAFETY: the caller's command buffer is recording outside a render pass.
++                unsafe { barrier.record(raw, command_buffer) };
++                synchronization.barriers += 1;
++            }
++            tracker.record_reaching(stages, uses, barrier, Reach::Named);
++            source.stages |= stages;
++            for used in uses {
++                source.stages |= used.read.stages | used.write.stages;
++                source.access |= used.write.access;
++            }
++
++            // SAFETY: the copy's resources are retained; the rows use its current backing.
++            unsafe { copy.record(raw, command_buffer, rows.as_ref()) };
++            synchronization.copies += 1;
++            synchronization.row_dispatches +=
++                u32::from(rows.as_ref().is_some_and(RowCopies::dispatched));
++            if let Some(sets) = rows.and_then(RowCopies::retained) {
++                lock(&self.staged_rows.sets).push(sets);
++            }
+         }
++
++        if !copies.is_empty() {
++            let barrier = Barrier {
++                src: source,
++                dst: Barrier::everything().dst,
++            };
++            // SAFETY: the caller's command buffer is recording outside a render pass.
++            unsafe { barrier.record(raw, command_buffer) };
++            synchronization.barriers += 1;
++        }
++
++        synchronization
+     }
+ 
+     /// Record what goes after the pass's instances (the module docs).
+@@ -373,7 +458,7 @@ impl PassSteps {
+                 source.record(raw, command_buffer);
+             }
+             let resolves = self.resolve_instance.iter().chain(&self.later_resolves);
+-            for (pass, framebuffer) in resolves {
++            for (index, (pass, framebuffer)) in resolves.enumerate() {
+                 let counts = &self.staged_rows.device.shared().counts;
+                 counts.render_pass_begun(PassBegun::Resolve);
+                 Barrier::everything().record(raw, command_buffer);
+@@ -382,6 +467,12 @@ impl PassSteps {
+                     .framebuffer(framebuffer.raw)
+                     .render_area(self.render_area)
+                     .clear_values(self.clear_values.as_slice());
++                self.trace.internal_pass(
++                    command_buffer,
++                    self.instances.len() + index,
++                    1 << 10,
++                    CopySynchronization::default(),
++                );
+                 raw.cmd_begin_render_pass(command_buffer, &begin, vk::SubpassContents::INLINE);
+                 raw.cmd_end_render_pass(command_buffer);
+             }
+diff --git a/crates/metal2vulkan-runtime/src/render/inline_first.rs b/crates/metal2vulkan-runtime/src/render/inline_first.rs
+index 7dad382..c373211 100644
+--- a/crates/metal2vulkan-runtime/src/render/inline_first.rs
++++ b/crates/metal2vulkan-runtime/src/render/inline_first.rs
+@@ -494,6 +494,16 @@ impl RenderLowering {
+                 extent: vk::Extent2D { width, height },
+             })
+             .clear_values(clear_values.as_slice());
++        self.core.trace_work(0).internal_pass(
++            held,
++            0,
++            0,
++            crate::gpu_trace::CopySynchronization {
++                copies: u32::MAX,
++                barriers: u32::MAX,
++                row_dispatches: 0,
++            },
++        );
+         // SAFETY: `held` is recording outside a render pass, held for this pass alone; the pass
+         // and framebuffer are live until the command buffer completes (the encoder holds them
+         // to its end, which retains them), the render area is the framebuffer's extent, and
+diff --git a/crates/metal2vulkan-runtime/src/render/inline_splits.rs b/crates/metal2vulkan-runtime/src/render/inline_splits.rs
+index de86170..38b6861 100644
+--- a/crates/metal2vulkan-runtime/src/render/inline_splits.rs
++++ b/crates/metal2vulkan-runtime/src/render/inline_splits.rs
+@@ -406,7 +406,7 @@ impl RenderLowering {
+                 &self.current,
+                 &copies,
+                 &self.layout,
+-                barrier,
++                (barrier, self.earlier.len()),
+             );
+             self.current.planned = true;
+             return Ok(());
+@@ -487,7 +487,7 @@ impl RenderLowering {
+                 instance,
+                 copies,
+                 &self.layout,
+-                barrier,
++                (barrier, at),
+             );
+         }
+         self.earlier[at].planned = true;
+@@ -553,7 +553,7 @@ fn record_kept(
+     instance: &Instance,
+     copies: &[ShadowCopy],
+     layout: &PassLayout,
+-    barrier: Barrier,
++    (barrier, index): (Barrier, usize),
+ ) {
+     let (Some(held), Some(kept)) = (core.held_pass(), instance.kept.as_ref()) else {
+         return;
+@@ -601,6 +601,16 @@ fn record_kept(
+         for step in &instance.before {
+             step.record_in(raw, held);
+         }
++        core.trace_work(0).internal_pass(
++            held,
++            index,
++            instance.split_reason,
++            crate::gpu_trace::CopySynchronization {
++                copies: copies.len() as u32,
++                barriers: u32::MAX,
++                row_dispatches: 0,
++            },
++        );
+         raw.cmd_begin_render_pass(held, &info, vk::SubpassContents::INLINE);
+         let begun = crate::work_counts::PassBegun::InlineSplit;
+         shared.counts.render_pass_begun(begun);
+diff --git a/crates/metal2vulkan-runtime/src/render/executions.rs b/crates/metal2vulkan-runtime/src/render/executions.rs
+index ba474ad..c1bba63 100644
+--- a/crates/metal2vulkan-runtime/src/render/executions.rs
++++ b/crates/metal2vulkan-runtime/src/render/executions.rs
+@@ -2319,6 +2319,7 @@ impl RenderExecution {
+             traced_pass_generation: 0,
+             earlier: Vec::new(),
+             current: Instance {
++                split_reason: 0,
+                 draws,
+                 shape: Versioned::new(snapshot.shape.clone()),
+                 compatible: Arc::clone(&snapshot.compatible),
+@@ -3291,9 +3292,11 @@ impl DeferredPass {
+                         barrier.record(raw, cb);
+                     }
+                     // Its steps before its first run, and after its last (`render/pass_steps.rs`).
+-                    if run_index == 0 {
+-                        steps.before(raw, cb, at + first);
+-                    }
++                    let synchronization = if run_index == 0 {
++                        steps.before(raw, cb, at + first)
++                    } else {
++                        crate::gpu_trace::CopySynchronization::default()
++                    };
+                     let copies = shadow_copies.filter(|_| shadowed);
+                     if let Some(copies) = copies {
+                         copies.record_in(raw, cb, false);
+@@ -3304,7 +3307,13 @@ impl DeferredPass {
+                     if let Some(run_steps) = run_steps {
+                         run_steps.before(raw, cb);
+                     }
+-                    steps.begin(raw, cb, at + first, pass, framebuffer);
++                    steps.begin(
++                        raw,
++                        cb,
++                        (at + first, run_index, synchronization),
++                        pass,
++                        framebuffer,
++                    );
+                     raw.cmd_execute_commands(cb, run);
+                     raw.cmd_end_render_pass(cb);
+                     steps.ended(raw, cb, at + first);

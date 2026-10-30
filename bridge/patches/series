@@ -23,3 +23,4 @@
 0023-preserve-metal-stages-and-host-visibility.patch
 0024-gpu-capture-metal-workload-metadata.patch
 0025-gpu-capture-copy-source-metadata.patch
+0026-order-internal-copy-groups-and-capture-pass-splits.patch
