@@ -19,6 +19,9 @@ actions, changed texture bindings and actual draw pipeline identities to Turnip'
 bounded GPU capture buffer. Deferred draws retain their Metal identities until
 their Vulkan commands are recorded. The driver owns capture control and export;
 the fixed metadata layout is documented in [bridge/TRACE_METADATA.md](bridge/TRACE_METADATA.md).
+The optional shader capture records the actual library inputs, function constants,
+SPIR-V, NIR and Adreno assembly with their pipeline identities. Its byte limits,
+files and compiler flags are documented in [bridge/SHADER_CAPTURE.md](bridge/SHADER_CAPTURE.md).
 Buffer-to-image copies also record their source and destination handles, regions
 and runtime origin. Shadow textures retain their allocation refusal and publish
 it in each capture window where they are used, with the texture identity.

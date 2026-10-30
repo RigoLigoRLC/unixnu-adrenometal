@@ -1,0 +1,185 @@
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -24,6 +24,7 @@
+ #![warn(missing_docs)]
+ 
+ mod address;
++pub mod shader_capture;
+ mod address_map;
+ mod address_pool;
+ mod amplification;
+diff --git a/crates/metal2vulkan-runtime/src/pipeline/objects.rs b/crates/metal2vulkan-runtime/src/pipeline/objects.rs
+--- a/crates/metal2vulkan-runtime/src/pipeline/objects.rs
++++ b/crates/metal2vulkan-runtime/src/pipeline/objects.rs
+@@ -1058,6 +1058,12 @@
+             .first()
+             .copied()
+             .ok_or_else(|| internal("the driver made no pipeline"))?;
++        if crate::shader_capture::enabled() {
++            crate::shader_capture::pipeline(raw, format!(
++                "kind=compute\nshader_module={:?}\nentry={:?}\nspecialization={:#?}\nsubgroup={:?}\nstage_flags={:?}\n",
++                c.object.module(), c.object.entry, c.specialization,
++                c.required_subgroup_size, c.stage_flags));
++        }
+         self.device.shared().counts.variant_pipeline_made();
+         let pipeline = RawPipeline {
+             device: self.device.clone(),
+diff --git a/crates/metal2vulkan-runtime/src/pipeline/graphics.rs b/crates/metal2vulkan-runtime/src/pipeline/graphics.rs
+--- a/crates/metal2vulkan-runtime/src/pipeline/graphics.rs
++++ b/crates/metal2vulkan-runtime/src/pipeline/graphics.rs
+@@ -1231,6 +1231,18 @@
+         });
+         shared.counts.driver_diagnostics_withheld(withheld);
+         let (raw, linked) = created?;
++        if crate::shader_capture::enabled() {
++            let mut details = format!("kind=render\ncompiled_pipeline={:?}\ngraphics_key={:#?}\n", pipeline.key, key);
++            for (index, stage) in self.stages.iter().enumerate() {
++                details.push_str(&format!("stage={:?} entry={:?} shader_module={:?}\n",
++                    stage.stage, stage.entry, stage.module()));
++                if let Some(module) = pipeline.stages.get(index) {
++                    details.push_str(&format!("stats={:?}\nstrategies={:#?}\nprecision={:#?}\nspecialization_layout={:#?}\n",
++                        module.stats, module.strategies, module.precision_notes, module.specialization));
++                }
++            }
++            crate::shader_capture::pipeline(raw, details);
++        }
+         let created_in = started.elapsed();
+         let kept_at = split.then(std::time::Instant::now);
+         if content.blend_flags.contains(
+diff --git a/crates/metal2vulkan-runtime/src/shader_capture.rs b/crates/metal2vulkan-runtime/src/shader_capture.rs
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/shader_capture.rs
+@@ -0,0 +1,132 @@
++//! ShaderCapture joins the Metal inputs, translated modules and actual Vulkan
++//! pipeline creations through Turnip's bounded file writer. The driver owns the
++//! process session, atomic publication, byte limits and final NIR/ISA export.
++
++use crate::{ComputePipelineState, Device, RenderPipelineState};
++use ash::vk;
++use ash::vk::Handle;
++use metal2vulkan::pipeline::{ComputePipelineDescriptor, RenderPipelineDescriptor, StageSource};
++use std::collections::BTreeSet;
++use std::ffi::{c_char, c_void, CString};
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Mutex, OnceLock};
++
++type Write = unsafe extern "system" fn(vk::Device, *const c_char, *const c_void, usize) -> u64;
++type PipelineId = unsafe extern "system" fn(vk::Device, vk::Pipeline) -> u64;
++
++struct Writer {
++    write: Write,
++    pipeline_id: PipelineId,
++    device: vk::Device,
++    session: u64,
++}
++
++static WRITER: OnceLock<Option<Writer>> = OnceLock::new();
++static NEXT_ID: AtomicU64 = AtomicU64::new(1);
++static LIBRARIES: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
++
++/// Initialize the process writer from the selected Vulkan device's entry points.
++pub fn start(device: &Device) {
++    WRITER.get_or_init(|| {
++        let write = device.device_proc_addr(c"vkNativeAdrenoShaderCaptureWrite")?;
++        let pipeline_id = device.device_proc_addr(c"vkNativeAdrenoShaderCapturePipelineId")?;
++        // These private entry points have the signatures declared by the paired Turnip build.
++        let write: Write = unsafe { std::mem::transmute(write) };
++        let pipeline_id: PipelineId = unsafe { std::mem::transmute(pipeline_id) };
++        let raw = device.raw().device.handle();
++        let session = unsafe { write(raw, std::ptr::null(), std::ptr::null(), 0) };
++        if session == 0 {
++            return None;
++        }
++        Some(Writer { write, pipeline_id, device: raw, session })
++    });
++}
++
++pub(crate) fn enabled() -> bool {
++    WRITER.get().and_then(Option::as_ref).is_some()
++}
++
++fn write(name: &str, bytes: &[u8]) -> bool {
++    let Some(writer) = WRITER.get().and_then(Option::as_ref) else {
++        return false;
++    };
++    let Ok(name) = CString::new(name) else {
++        return false;
++    };
++    unsafe { (writer.write)(writer.device, name.as_ptr(), bytes.as_ptr().cast(), bytes.len()) != 0 }
++}
++
++fn header() -> String {
++    let session = WRITER.get().and_then(Option::as_ref).map_or(0, |writer| writer.session);
++    format!("version=1\npid={}\nsession_id={}\n", std::process::id(), session)
++}
++
++fn stage_input(stage: &StageSource) -> String {
++    match stage {
++        StageSource::Function(descriptor) => {
++            let function = &descriptor.function;
++            let library = function.library();
++            let name: String = library.content_hash().iter().map(|byte| format!("{byte:02x}")).collect();
++            let suffix = if library.bytes().starts_with(b"MTLB") { "metallib" } else { "air" };
++            let file = format!("input-library-{name}.{suffix}");
++            let mut libraries = LIBRARIES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
++            if !libraries.contains(&file) && libraries.len() < 256 && write(&file, library.bytes()) {
++                libraries.insert(file.clone());
++            }
++            let saved = libraries.contains(&file);
++            drop(libraries);
++            format!("library={file} library_saved={saved} function_index={} function={:?} stage={:?}\nconstants={:#?}\n",
++                function.index(), function.info().name, function.info().stage, descriptor.constants)
++        }
++        StageSource::Compiled(function) => {
++            format!("compiled_function={:?}\n", function.key())
++        }
++    }
++}
++
++/// Save the exact Metal function constants, library bytes and render descriptor
++/// after creation, including the frontend handle used by the workload trace.
++pub fn render_input(handle: usize, state: &RenderPipelineState, descriptor: &RenderPipelineDescriptor) {
++    if !enabled() {
++        return;
++    }
++    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
++    let mut text = header();
++    text.push_str(&format!("frontend_handle={handle}\nruntime_pipeline={}\nstate={state:?}\nvertex {}",
++        state.identifier_value(), stage_input(&descriptor.vertex)));
++    if let Some(fragment) = &descriptor.fragment {
++        text.push_str(&format!("fragment {}", stage_input(fragment)));
++    }
++    text.push_str(&format!("colors={:#?}\ndepth={:?}\nstencil={:?}\nsamples={}\ntopology={:?}\nvertex_descriptor={:#?}\nrasterization={}\n",
++        descriptor.color_attachments, descriptor.depth_format, descriptor.stencil_format,
++        descriptor.raster_sample_count, descriptor.input_primitive_topology,
++        descriptor.vertex_descriptor, descriptor.rasterization_enabled));
++    write(&format!("metal-render-{id}.txt"), text.as_bytes());
++}
++
++/// Save a compute state's source function and descriptor beside its frontend handle.
++pub fn compute_input(handle: usize, state: &ComputePipelineState, descriptor: &ComputePipelineDescriptor) {
++    if !enabled() {
++        return;
++    }
++    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
++    let mut text = header();
++    text.push_str(&format!("frontend_handle={handle}\nruntime_pipeline={}\n{}",
++        state.identifier_value(), stage_input(&descriptor.kernel)));
++    text.push_str(&format!("max_threads={:?}\nmultiple_of_execution_width={}\nindirect={}\nmax_call_stack_depth={}\n",
++        descriptor.max_total_threads_per_threadgroup,
++        descriptor.threadgroup_size_is_multiple_of_execution_width,
++        descriptor.support_indirect_command_buffers, descriptor.max_call_stack_depth));
++    write(&format!("metal-compute-{id}.txt"), text.as_bytes());
++}
++
++pub(crate) fn pipeline(raw: vk::Pipeline, details: String) {
++    let Some(writer) = WRITER.get().and_then(Option::as_ref) else {
++        return;
++    };
++    let id = unsafe { (writer.pipeline_id)(writer.device, raw) };
++    let mut text = header();
++    text.push_str(&format!("vk_pipeline={}\ndriver_capture_id={id}\n{details}", raw.as_raw()));
++    let record = NEXT_ID.fetch_add(1, Ordering::Relaxed);
++    write(&format!("runtime-pipeline-{id}-{record}.txt"), text.as_bytes());
++}

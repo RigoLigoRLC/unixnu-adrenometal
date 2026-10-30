@@ -170,6 +170,7 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         options.policy.pipeline_waits = metal2vulkan::device::PipelineWaitPolicy::Exact;
 
         let device = Device::system_default_with(&options).map_err(e("device"))?;
+        metal2vulkan_runtime::shader_capture::start(&device);
         // The frontend keeps each imported allocation mapped until its runtime owner releases it.
         // Commands therefore retain their existing resources without recording calls for rebinding.
         device.refuse_rebinds();
@@ -1254,8 +1255,11 @@ pub unsafe extern "C" fn nmb_compute_pipeline_new_with_options(device: *mut NmbD
                                                               options: *const NmbPipelineOptions) -> *mut NmbComputePipeline {
     guard(std::ptr::null_mut(), || {
         let resolved = unsafe { pipeline_options(options)? };
-        let state = get(device)?.0.new_compute_pipeline_state_with_function(&get(function)?.0, &resolved);
-        Ok(boxed(NmbComputePipeline(state.map_err(e("compute pipeline"))?)))
+        let descriptor = ComputePipelineDescriptor::new(StageSource::Function(get(function)?.0.function_descriptor()));
+        let state = get(device)?.0.new_compute_pipeline_state_with_function(&get(function)?.0, &resolved).map_err(e("compute pipeline"))?;
+        let handle = boxed(NmbComputePipeline(state.clone()));
+        metal2vulkan_runtime::shader_capture::compute_input(handle as usize, &state, &descriptor);
+        Ok(handle)
     })
 }
 
@@ -1293,8 +1297,11 @@ pub unsafe extern "C" fn nmb_compute_pipeline_new_with_descriptor(device: *mut N
                                                                  options: *const NmbPipelineOptions) -> *mut NmbComputePipeline {
     guard(std::ptr::null_mut(), || {
         let resolved = unsafe { pipeline_options(options)? };
-        let state = get(device)?.0.new_compute_pipeline_state(&compute_descriptor(descriptor)?, &resolved).map_err(e("compute pipeline"))?;
-        Ok(boxed(NmbComputePipeline(state)))
+        let descriptor = compute_descriptor(descriptor)?;
+        let state = get(device)?.0.new_compute_pipeline_state(&descriptor, &resolved).map_err(e("compute pipeline"))?;
+        let handle = boxed(NmbComputePipeline(state.clone()));
+        metal2vulkan_runtime::shader_capture::compute_input(handle as usize, &state, &descriptor);
+        Ok(handle)
     })
 }
 
@@ -1399,8 +1406,11 @@ pub unsafe extern "C" fn nmb_render_pipeline_new_with_options(device: *mut NmbDe
     guard(std::ptr::null_mut(), || {
         let device = &get(device)?.0;
         let resolved = unsafe { pipeline_options(options)? };
-        let state = device.new_render_pipeline_state(&render_descriptor(descriptor)?, &resolved).map_err(e("render pipeline"))?;
-        Ok(boxed(NmbRenderPipeline(state)))
+        let descriptor = render_descriptor(descriptor)?;
+        let state = device.new_render_pipeline_state(&descriptor, &resolved).map_err(e("render pipeline"))?;
+        let handle = boxed(NmbRenderPipeline(state.clone()));
+        metal2vulkan_runtime::shader_capture::render_input(handle as usize, &state, &descriptor);
+        Ok(handle)
     })
 }
 
