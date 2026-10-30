@@ -1,0 +1,14 @@
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -5289,7 +5289,9 @@
+                     // SAFETY: the command buffer before the pass is recording outside a render
+                     // pass, and only this encoder records it; the steps' objects are live until
+                     // the command buffer completes (the encoder retains them with the draws).
+-                    unsafe { steps.before(raw, command_buffer, 0) }
++                    unsafe {
++                        steps.before(raw, command_buffer, 0);
++                    }
+                 });
+             }
+             core.release_pass()?;
