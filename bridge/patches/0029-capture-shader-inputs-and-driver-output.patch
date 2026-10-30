@@ -20,7 +20,7 @@ diff --git a/crates/metal2vulkan-runtime/src/pipeline/objects.rs b/crates/metal2
 +            crate::shader_capture::pipeline(raw, format!(
 +                "kind=compute\nshader_module={:?}\nentry={:?}\nspecialization={:#?}\nsubgroup={:?}\nstage_flags={:?}\n",
 +                c.object.module(), c.object.entry, c.specialization,
-+                c.required_subgroup_size, c.stage_flags));
++                c.required_subgroup_size, c.stage_flags.as_raw()));
 +        }
          self.device.shared().counts.variant_pipeline_made();
          let pipeline = RawPipeline {
@@ -36,7 +36,7 @@ diff --git a/crates/metal2vulkan-runtime/src/pipeline/graphics.rs b/crates/metal
 +            let mut details = format!("kind=render\ncompiled_pipeline={:?}\ngraphics_key={:#?}\n", pipeline.key, key);
 +            for (index, stage) in self.stages.iter().enumerate() {
 +                details.push_str(&format!("stage={:?} entry={:?} shader_module={:?}\n",
-+                    stage.stage, stage.entry, stage.module()));
++                    stage.stage.as_raw(), stage.entry, stage.module()));
 +                if let Some(module) = pipeline.stages.get(index) {
 +                    details.push_str(&format!("stats={:?}\nstrategies={:#?}\nprecision={:#?}\nspecialization_layout={:#?}\n",
 +                        module.stats, module.strategies, module.precision_notes, module.specialization));
@@ -86,7 +86,7 @@ diff --git a/crates/metal2vulkan-runtime/src/shader_capture.rs b/crates/metal2vu
 +        // These private entry points have the signatures declared by the paired Turnip build.
 +        let write: Write = unsafe { std::mem::transmute(write) };
 +        let pipeline_id: PipelineId = unsafe { std::mem::transmute(pipeline_id) };
-+        let raw = device.raw().device.handle();
++        let raw = unsafe { device.raw().device.handle() };
 +        let session = unsafe { write(raw, std::ptr::null(), std::ptr::null(), 0) };
 +        if session == 0 {
 +            return None;
